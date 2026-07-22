@@ -9,6 +9,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::analyzer::DefKind;
+use crate::config::GlobalDoc;
 use crate::docs;
 use crate::docs::Platform;
 use crate::parser::{head_sym, Form};
@@ -20,7 +21,11 @@ pub struct Backend {
     pub workspace: Workspace,
     workspace_root: OnceLock<std::path::PathBuf>,
     /// Extra globals from `.fennel-ls.toml` that suppress unknown-identifier warnings.
+    /// Populated from `known_globals` plus roots inferred from `global_docs` keys.
     extra_globals: OnceLock<HashSet<String>>,
+    /// Per-symbol hover docs loaded from `global_docs` (inline or via `include`).
+    /// Keys are exact Fennel symbol names, e.g. `"Mosaic.Grid.set_tile"`.
+    global_docs: OnceLock<HashMap<String, GlobalDoc>>,
 }
 
 impl Backend {
@@ -30,6 +35,7 @@ impl Backend {
             workspace: Workspace::new(),
             workspace_root: OnceLock::new(),
             extra_globals: OnceLock::new(),
+            global_docs: OnceLock::new(),
         }
     }
 
@@ -115,8 +121,24 @@ impl LanguageServer for Backend {
                 self.workspace.configure_platform(p);
             }
 
-            if let Some(globals) = config.known_globals {
-                let _ = self.extra_globals.set(globals.into_iter().collect());
+            // Build extra_globals: explicit known_globals + roots inferred from
+            // global_docs keys so callers don't have to list them twice.
+            let mut all_globals: HashSet<String> = config.known_globals
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if let Some(docs) = &config.global_docs {
+                for key in docs.keys() {
+                    if let Some(root) = key.split(['.', ':']).find(|s| !s.is_empty()) {
+                        all_globals.insert(root.to_string());
+                    }
+                }
+            }
+            if !all_globals.is_empty() {
+                let _ = self.extra_globals.set(all_globals);
+            }
+            if let Some(docs) = config.global_docs {
+                let _ = self.global_docs.set(docs);
             }
 
             let _ = self.workspace_root.set(path);
@@ -260,6 +282,35 @@ impl LanguageServer for Backend {
                     }),
                     range: Some(range),
                 });
+            }
+
+            // Custom global docs from `.fennel-ls.toml` / included files.
+            // Try the full name first (e.g. "Mosaic.Grid.set_tile"), then
+            // progressively strip trailing members until a match is found or
+            // the chain is exhausted.  This lets a single "Mosaic.Grid" entry
+            // serve as a fallback for any Mosaic.Grid.* call with no specific
+            // entry.
+            if let Some(docs) = self.global_docs.get() {
+                let mut key: &str = &name;
+                loop {
+                    if let Some(doc) = docs.get(key) {
+                        let value = match &doc.doc {
+                            Some(d) => format!("```fennel\n{}\n```\n\n{}", doc.signature, d),
+                            None    => format!("```fennel\n{}\n```", doc.signature),
+                        };
+                        return Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value,
+                            }),
+                            range: Some(range),
+                        });
+                    }
+                    match key.rfind('.') {
+                        Some(i) => key = &key[..i],
+                        None    => break,
+                    }
+                }
             }
 
             None
@@ -492,6 +543,28 @@ impl LanguageServer for Backend {
                         })),
                         ..Default::default()
                     });
+                }
+            }
+
+            // Custom global docs — surface every documented name as a
+            // completion candidate so editors can offer e.g. "Mosaic.Grid.set_tile"
+            // when the user starts typing the namespace.
+            if let Some(docs) = self.global_docs.get() {
+                for (name, doc) in docs {
+                    if seen.insert(name.clone()) {
+                        items.push(CompletionItem {
+                            label: name.clone(),
+                            kind: Some(CompletionItemKind::FUNCTION),
+                            detail: Some(doc.signature.clone()),
+                            documentation: doc.doc.as_ref().map(|d| {
+                                Documentation::MarkupContent(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: d.clone(),
+                                })
+                            }),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
 

@@ -20,3 +20,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+[dev-dependencies]
+tempfile = "3"

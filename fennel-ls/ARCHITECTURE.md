@@ -62,7 +62,7 @@ analysis yet.
 | **Find references** | Returns all use-sites of the definition the cursor is on (or the definition a reference points to). Includes the definition itself. |
 | **Document highlight** | Same logic as find-references but returns `WRITE` kind for the definition and `READ` for uses. |
 | **Document symbols** | Lists every definition in the file (all `DefKind` variants). |
-| **Completion** | Returns scope-local definitions (respecting lexical scope at the cursor position) followed by all built-ins. Deduplicates by name. Sorted alphabetically. |
+| **Completion** | Returns scope-local definitions (respecting lexical scope at the cursor position) followed by all built-ins and any custom `global_docs` entries. Deduplicates by name. Sorted alphabetically. |
 | **Rename** | Renames all occurrences of a definition within the current file. |
 | **Code actions** | `var → local` quickfix on any `var` that was never mutated. Unknown-identifier quickfix that inserts `(local name nil)` above the offending line. |
 | **Semantic tokens** | Full-document classification (`function`, `parameter`, `variable`, `macro`). Modifiers: `definition`, `readonly`. Delta-encoded from the sorted `syms` vec. |
@@ -74,9 +74,81 @@ Text sync mode: **INCREMENTAL** — the client sends only changed ranges; each
 then the pipeline re-runs on the full (now-updated) text.
 
 **Configuration:** on `initialize`, the server reads `.fennel-ls.toml` from
-the workspace root (if present). Supported fields: `platform` (selects the
-active `BuiltinSet`) and `known_globals` (suppresses unknown-identifier
-warnings for named globals).
+the workspace root (if present). See the **Configuration** section below.
+
+---
+
+## Configuration
+
+The server looks for `.fennel-ls.toml` in the workspace root on startup.
+All fields are optional; an empty file or a missing file is valid.
+
+### Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `platform` | string | Lua platform for built-in docs: `"lua51"`, `"lua52"`, `"lua53"`, `"lua54"` (default), `"luajit"`, `"luau"`. |
+| `known_globals` | string array | Global names that suppress unknown-identifier warnings but have no hover documentation. Roots derived from `global_docs` keys are added automatically, so only list globals with no associated docs here (e.g. engine-injected tables like `state`). |
+| `include` | string array | Paths (relative to the workspace root) of extra TOML files whose `[global_docs]` sections are merged into this config. Use this to keep engine/framework API docs in one shared file and reference them from many per-project configs. |
+| `global_docs` | table | Per-symbol hover documentation. See below. |
+
+### `global_docs`
+
+Each key is the exact Fennel symbol as it appears in source code, including
+dots for namespaced APIs.  Each value has two sub-fields:
+
+| Sub-field | Required | Description |
+|---|---|---|
+| `signature` | yes | Short Fennel-style call form shown in the hover code block. |
+| `doc` | no | Prose description shown below the signature. Supports Markdown. |
+
+**Root inference:** the server automatically extracts the root of every
+`global_docs` key (everything before the first `.` or `:`) and adds it to the
+known-globals set.  You do not need to list `Mosaic` in `known_globals` just
+because you have `global_docs."Mosaic.Grid.set_tile"`.
+
+**Hover fallback:** on hover the server tries the full symbol name first
+(e.g. `Mosaic.Grid.set_tile`), then strips the last member and retries
+(`Mosaic.Grid`), then strips again (`Mosaic`), until it finds a match or
+exhausts the chain.  A single entry for a namespace therefore acts as a
+fallback doc for any undocumented member of that namespace.
+
+### Minimal example
+
+```toml
+platform = "luajit"
+known_globals = ["state"]          # persistent game-state table, no docs needed
+include = ["../../engine/api.toml"] # engine API docs live in the engine repo
+```
+
+### Splitting docs into a shared file
+
+Put the `[global_docs]` table in a separate TOML file (e.g. `mosaic.toml`)
+alongside the engine source, then reference it from each project's
+`.fennel-ls.toml`.  The included file may only contain a `[global_docs]`
+section; all other fields are ignored.
+
+**`engine/mosaic.toml`:**
+```toml
+[global_docs."Mosaic.Grid.set_tile"]
+signature = "(Mosaic.Grid.set_tile col row index primary secondary rotation)"
+doc = """
+Draw a tile on the grid.
+- `primary` / `secondary` — `{r g b a}` colour tables (values 0–1).
+- `rotation` — radians clockwise around the tile centre (default `0`).
+"""
+
+[global_docs."Mosaic.Input.cursor_cell"]
+signature = "(Mosaic.Input.cursor_cell)"
+doc = "Returns `{col row}` of the cell under the cursor, or `nil` if the cursor is outside the grid."
+```
+
+**`my-game/.fennel-ls.toml`:**
+```toml
+platform = "luajit"
+known_globals = ["state"]
+include = ["../engine/mosaic.toml"]
+```
 
 ---
 

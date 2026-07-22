@@ -1,23 +1,111 @@
 /// User configuration loaded from `.fennel-ls.toml` in the workspace root.
+///
+/// # Quick reference
+///
+/// ```toml
+/// platform = "luajit"
+/// known_globals = ["state"]
+/// include = ["path/to/my-api.toml"]
+///
+/// [global_docs."MyLib.do_thing"]
+/// signature = "(MyLib.do_thing arg1 arg2)"
+/// doc = "Does the thing."
+/// ```
+///
+/// See the **Configuration** section of ARCHITECTURE.md for full details.
 
+use std::collections::HashMap;
 use serde::Deserialize;
 
+/// Documentation entry for a single global name.
+///
+/// Used in `[global_docs]` sections — either inline in `.fennel-ls.toml`
+/// or in an included file. Both fields mirror the layout used for built-in
+/// docs so hover output is consistent.
+#[derive(Debug, Default, Deserialize)]
+pub struct GlobalDoc {
+    /// Short fennel-style call signature shown in the hover code block.
+    /// Example: `"(Mosaic.Grid.set_tile col row index primary secondary rotation)"`
+    pub signature: String,
+    /// Prose description shown below the signature. Supports Markdown.
+    pub doc: Option<String>,
+}
+
+/// Parsed contents of an include file (a TOML file that only contributes
+/// `[global_docs]` entries and nothing else).
+#[derive(Debug, Default, Deserialize)]
+struct IncludeFile {
+    global_docs: Option<HashMap<String, GlobalDoc>>,
+}
+
+/// Full user configuration.
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     /// Target Lua platform: "lua51", "lua52", "lua53", "lua54" (default), "luajit", "luau"
     pub platform: Option<String>,
-    /// Extra global names that should not produce unknown-identifier warnings.
+
+    /// Extra global names that suppress unknown-identifier warnings but have
+    /// no hover documentation.  Roots inferred from `global_docs` keys are
+    /// added automatically, so you only need this for undocumented globals
+    /// (e.g. `known_globals = ["state"]`).
     pub known_globals: Option<Vec<String>>,
+
+    /// Paths (relative to the workspace root) of extra TOML files whose
+    /// `[global_docs]` sections are merged into this config.
+    /// Useful for keeping engine/framework API docs in one shared file and
+    /// referencing them from multiple per-project `.fennel-ls.toml` files.
+    ///
+    /// Example:
+    /// ```toml
+    /// include = ["../../my-engine/api-docs.toml"]
+    /// ```
+    pub include: Option<Vec<String>>,
+
+    /// Inline documentation for global names (functions, namespaces, values).
+    /// Keys are the exact Fennel symbol as it appears in source, including
+    /// dots for namespaced APIs (e.g. `"Mosaic.Grid.set_tile"`).
+    ///
+    /// Roots are extracted automatically and added to the known-globals set,
+    /// so you do not need to repeat them in `known_globals`.
+    ///
+    /// Hover: the server does an exact-match lookup first, then strips
+    /// trailing `.member` segments until it finds a match or exhausts the
+    /// chain.  This means a single `"Mosaic.Grid"` entry acts as a fallback
+    /// for any `Mosaic.Grid.*` call that has no specific entry.
+    pub global_docs: Option<HashMap<String, GlobalDoc>>,
 }
 
 impl Config {
+    /// Load configuration from `<root>/.fennel-ls.toml`.
+    /// Missing file or parse errors return a silent default.
+    /// Include files that are missing or unparseable are silently skipped.
     pub fn load(root: &std::path::Path) -> Self {
         let path = root.join(".fennel-ls.toml");
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(_) => return Self::default(),
         };
-        toml::from_str(&text).unwrap_or_default()
+        let mut config: Config = toml::from_str(&text).unwrap_or_default();
+
+        // Merge included doc files into global_docs
+        if let Some(includes) = config.include.take() {
+            let mut all_docs = config.global_docs.take().unwrap_or_default();
+            for rel in &includes {
+                let inc_path = root.join(rel);
+                if let Ok(text) = std::fs::read_to_string(&inc_path) {
+                    if let Ok(inc) = toml::from_str::<IncludeFile>(&text) {
+                        if let Some(docs) = inc.global_docs {
+                            all_docs.extend(docs);
+                        }
+                    }
+                }
+            }
+            if !all_docs.is_empty() {
+                config.global_docs = Some(all_docs);
+            }
+        }
+
+        config
     }
 }
 
@@ -34,6 +122,8 @@ mod tests {
         let c = parse("");
         assert!(c.platform.is_none());
         assert!(c.known_globals.is_none());
+        assert!(c.include.is_none());
+        assert!(c.global_docs.is_none());
     }
 
     #[test]
@@ -65,5 +155,101 @@ known_globals = ["my_lib"]
     fn invalid_toml_returns_default() {
         let c: Config = toml::from_str("not valid {{{{").unwrap_or_default();
         assert!(c.platform.is_none());
+    }
+
+    #[test]
+    fn include_field_parsed() {
+        let c = parse(r#"include = ["../../my-api.toml", "extra.toml"]"#);
+        let inc = c.include.unwrap();
+        assert_eq!(inc, vec!["../../my-api.toml", "extra.toml"]);
+    }
+
+    #[test]
+    fn global_docs_inline_parsed() {
+        let c = parse(r#"
+[global_docs."Mosaic.Grid.resize"]
+signature = "(Mosaic.Grid.resize cols rows)"
+doc = "Resize the grid."
+"#);
+        let docs = c.global_docs.unwrap();
+        let entry = docs.get("Mosaic.Grid.resize").unwrap();
+        assert_eq!(entry.signature, "(Mosaic.Grid.resize cols rows)");
+        assert_eq!(entry.doc.as_deref(), Some("Resize the grid."));
+    }
+
+    #[test]
+    fn global_docs_doc_field_is_optional() {
+        let c = parse(r#"
+[global_docs."MyLib.fn"]
+signature = "(MyLib.fn x)"
+"#);
+        let docs = c.global_docs.unwrap();
+        let entry = docs.get("MyLib.fn").unwrap();
+        assert!(entry.doc.is_none());
+    }
+
+    #[test]
+    fn global_docs_merge_from_include_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write the included file
+        let inc_path = dir.path().join("api.toml");
+        let mut f = std::fs::File::create(&inc_path).unwrap();
+        writeln!(f, r#"
+[global_docs."Engine.tick"]
+signature = "(Engine.tick dt)"
+doc = "Called every frame."
+"#).unwrap();
+
+        // Write the base config
+        let base_path = dir.path().join(".fennel-ls.toml");
+        let mut f = std::fs::File::create(&base_path).unwrap();
+        writeln!(f, r#"include = ["api.toml"]"#).unwrap();
+
+        let config = Config::load(dir.path());
+        let docs = config.global_docs.unwrap();
+        let entry = docs.get("Engine.tick").unwrap();
+        assert_eq!(entry.signature, "(Engine.tick dt)");
+        assert_eq!(entry.doc.as_deref(), Some("Called every frame."));
+    }
+
+    #[test]
+    fn include_missing_file_is_silently_skipped() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join(".fennel-ls.toml");
+        let mut f = std::fs::File::create(&base_path).unwrap();
+        writeln!(f, r#"include = ["does-not-exist.toml"]"#).unwrap();
+        // Should not panic; global_docs stays empty
+        let config = Config::load(dir.path());
+        assert!(config.global_docs.is_none());
+    }
+
+    #[test]
+    fn inline_and_included_docs_are_merged() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+
+        let inc_path = dir.path().join("extra.toml");
+        let mut f = std::fs::File::create(&inc_path).unwrap();
+        writeln!(f, r#"
+[global_docs."Lib.from_include"]
+signature = "(Lib.from_include)"
+"#).unwrap();
+
+        let base_path = dir.path().join(".fennel-ls.toml");
+        let mut f = std::fs::File::create(&base_path).unwrap();
+        writeln!(f, r#"
+include = ["extra.toml"]
+
+[global_docs."Lib.inline"]
+signature = "(Lib.inline)"
+"#).unwrap();
+
+        let config = Config::load(dir.path());
+        let docs = config.global_docs.unwrap();
+        assert!(docs.contains_key("Lib.from_include"), "missing include entry");
+        assert!(docs.contains_key("Lib.inline"), "missing inline entry");
     }
 }
