@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "fennel-ls",
+    "tree-sitter-fennel",
+]
+resolver = "2"

@@ -1,0 +1,63 @@
+===
+shebang
+===
+
+#!/usr/bin/env fennel
+(print "Yummy!")
+
+---
+
+(program
+  (shebang)
+  (list
+    call: (symbol)
+    item: (string
+            content: (string_content))))
+
+===
+function call
+===
+
+(test 1 a)
+(test (test))
+
+---
+
+(program
+  (list
+    (symbol)
+    (number)
+    (symbol))
+  (list
+    (symbol)
+    (list
+      (symbol))))
+
+===
+method call
+===
+
+(foo.bar.baz:method :arg)
+(foo.bar.baz :method :arg)
+
+---
+
+(program
+  (list
+    call: (multi_symbol_method
+            base: (multi_symbol
+                    base: (symbol_fragment)
+                    member: (symbol_fragment)
+                    member: (symbol_fragment))
+            method: (symbol_fragment))
+    item: (string
+            content: (string_content)))
+  (list
+    call: (multi_symbol
+            base: (symbol_fragment)
+            member: (symbol_fragment)
+            member: (symbol_fragment))
+    item: (string
+            content: (string_content))
+    item: (string
+            content: (string_content))))

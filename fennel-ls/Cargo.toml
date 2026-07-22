@@ -1,0 +1,22 @@
+[package]
+name = "fennel-ls"
+version = "0.1.0"
+edition = "2021"
+description = "A language server for the Fennel programming language (Rust rewrite)"
+
+[[bin]]
+name = "fennel-ls"
+path = "src/main.rs"
+
+[dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "5"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }

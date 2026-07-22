@@ -1,0 +1,8 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+
+[grammar.js,grammar-lib/**.js,extensions/**.js,src/scanner.c]
+indent_style = tab

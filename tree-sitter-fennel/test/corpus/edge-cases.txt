@@ -1,0 +1,173 @@
+===
+comma as whitespace separator
+===
+
+[a, b, c]
+{:key value, :key2 value2}
+(f a, b, c)
+
+---
+
+(program
+  (sequence
+    item: (symbol)
+    item: (symbol)
+    item: (symbol))
+  (table
+    item: (table_pair
+            key: (string
+                   content: (string_content))
+            value: (symbol))
+    item: (table_pair
+            key: (string
+                   content: (string_content))
+            value: (symbol)))
+  (list
+    call: (symbol)
+    item: (symbol)
+    item: (symbol)
+    item: (symbol)))
+
+===
+unquote_splice in sequence and multiple splices
+===
+
+`[,@xs]
+`(,@xs ,@ys)
+
+---
+
+(program
+  (quasi_quote_reader_macro
+    expression: (sequence
+                  item: (unquote_splice_reader_macro
+                          expression: (symbol))))
+  (quasi_quote_reader_macro
+    expression: (list
+                  call: (unquote_splice_reader_macro
+                          expression: (symbol))
+                  item: (unquote_splice_reader_macro
+                          expression: (symbol)))))
+
+===
+empty forms
+===
+
+()
+[]
+{}
+
+---
+
+(program
+  (list)
+  (sequence)
+  (table))
+
+===
+trailing comma before closing bracket
+===
+
+(f a, b,)
+[1, 2,]
+{:k v,}
+
+---
+
+(program
+  (list
+    call: (symbol)
+    item: (symbol)
+    item: (symbol))
+  (sequence
+    item: (number)
+    item: (number))
+  (table
+    item: (table_pair
+            key: (string
+                   content: (string_content))
+            value: (symbol))))
+
+===
+hashfn on multi-symbol
+===
+
+#string.format
+#(tostring $)
+#[$1 $2]
+
+---
+
+(program
+  (hashfn_reader_macro
+    expression: (multi_symbol
+                  base: (symbol_fragment)
+                  member: (symbol_fragment)))
+  (hashfn_reader_macro
+    expression: (list
+                  call: (symbol)
+                  item: (symbol)))
+  (hashfn_reader_macro
+    expression: (sequence
+                  item: (symbol)
+                  item: (symbol))))
+
+===
+unfinished tables
+===
+
+{&as}
+{lmao}
+{:k v
+ lmao-no}
+
+---
+
+(program
+  (table
+    item: (table_pair
+            key: (symbol_option)))
+  (table
+    item: (table_pair
+            key: (symbol)))
+  (table
+    item: (table_pair
+            key: (string
+                   content: (string_content))
+            value: (symbol))
+    item: (table_pair
+            key: (symbol))))
+
+===
+colon string + reader macros
+===
+
+(:lol)
+( :: )
+(:#lmao)
+(:#)
+(#:mia)
+
+---
+
+(program
+  (list (string (string_content)))
+  (list (string (string_content)))
+  (list (string (string_content)))
+  (list (string (string_content)))
+  (list (hashfn_reader_macro (string (string_content)))))
+
+===
+incorrect shebang
+===
+
+# !lol
+#!lol
+
+---
+
+(program
+  (symbol)
+  (symbol)
+  (hashfn_reader_macro
+    (symbol)))

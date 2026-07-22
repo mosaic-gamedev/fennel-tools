@@ -1,0 +1,444 @@
+===
+numbers
+===
+
+1
+1.0
++1
+-1
+-1.0
+.1
++.1
+.nan
+.inf
++.nan
++.inf
+-.nan
+-.inf
+1e1
+1e-1
+1_0.1_0
+0x1
+-0x1
+0x1.1
++0x1.1
+0x1p1
+-0x1_0.1_0p1_0
+
+---
+
+(program
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number)
+  (number))
+
+===
+double quote strings
+===
+
+"nil"
+";onettwothree"
+"string"
+"string\""
+"string\\"
+"\115\116\114"
+"\x32\u{33}"
+
+---
+
+(program
+  (string
+    (string_content))
+  (string
+    (string_content))
+  (string
+    (string_content))
+  (string
+    (string_content
+      (escape_sequence)))
+  (string
+    (string_content
+      (escape_sequence)))
+  (string
+    (string_content
+      (escape_sequence)
+      (escape_sequence)
+      (escape_sequence)))
+  (string
+    (string_content
+      (escape_sequence)
+      (escape_sequence))))
+
+===
+colon strings
+===
+
+:test
+:*
+:#
+:#lol
+:?
+:-
+:+
+:9
+:_
+:/
+:<
+:>
+:=
+:^
+:.
+::
+:true
+:false
+:nil
+
+---
+
+(program
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content))
+  (string (string_content)))
+
+===
+symbols
+===
+
+a
+?a
+a?
+a-b-c
+a_b_c
+$1
+$
+$...
+<>
+test#test#test
+.
+..
+...
+?.
+:
+#
+~=
+
+---
+
+(program
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol)
+  (symbol))
+
+===
+symbol options
+===
+
+&
+&asdaskldjh
+&#hoi
+
+---
+
+(program
+  (symbol_option)
+  (symbol_option)
+  (symbol_option))
+
+===
+multi symbols
+===
+
+string.format
+a.b.c.d.e.f.g
+ha.#haha
+$bl>/?.asd
+
+---
+
+(program
+  (multi_symbol
+    (symbol_fragment)
+    (symbol_fragment))
+  (multi_symbol
+    (symbol_fragment)
+    (symbol_fragment)
+    (symbol_fragment)
+    (symbol_fragment)
+    (symbol_fragment)
+    (symbol_fragment)
+    (symbol_fragment))
+  (multi_symbol
+    (symbol_fragment)
+    (symbol_fragment))
+  (multi_symbol
+    (symbol_fragment)
+    (symbol_fragment)))
+
+===
+booleans + nil
+===
+
+true
+false
+nil
+
+---
+
+(program
+  (boolean)
+  (boolean)
+  (nil))
+
+===
+tables
+===
+
+{: value
+ (+ 1 2) #nil
+ "key" value
+ :#$le_key :mamamia
+ 69 24
+ ?. nestro}
+
+{key value}
+
+---
+
+(program
+  (table
+    item: (table_pair
+            key: (symbol)
+            value: (symbol))
+    item: (table_pair
+            key: (list
+                   call: (symbol)
+                   item: (number)
+                   item: (number))
+            value: (hashfn_reader_macro
+                     expression: (nil)))
+    item: (table_pair
+            key: (string
+                   content: (string_content))
+            value: (symbol))
+    item: (table_pair
+            key: (string
+                   content: (string_content))
+            value: (string
+                     content: (string_content)))
+    item: (table_pair
+            key: (number)
+            value: (number))
+    item: (table_pair
+            key: (symbol)
+            value: (symbol)))
+  (table
+    item: (table_pair
+            key: (symbol)
+            value: (symbol))))
+
+===
+sequences / sequential tables
+===
+
+["abd" :lol ?. : #true]
+[a b & cs]
+
+---
+
+(program
+  (sequence
+    (string (string_content))
+    (string (string_content))
+    (symbol)
+    (symbol)
+    (hashfn_reader_macro
+      (boolean)))
+  (sequence
+    (symbol)
+    (symbol)
+    (symbol_option)
+    (symbol)))
+
+===
+comments
+===
+
+; this is a comment
+;; ayo, another comment!
+;;;;;;;;;;;;;; WOOOOOOOOOOOOOOOOOOOOOOO!
+
+(;
+ print ;
+ foo ;
+ [ ;
+ x ;
+ ] ;
+ x ;
+ ) ;
+
+---
+
+(program
+  (comment
+    body: (comment_body))
+  (comment
+    body: (comment_body))
+  (comment
+    body: (comment_body))
+  (list
+    (comment
+      body: (comment_body))
+    call: (symbol)
+    (comment
+      body: (comment_body)) item: (symbol)
+    (comment
+      body: (comment_body))
+    item: (sequence
+            (comment
+              body: (comment_body))
+            item: (symbol)
+            (comment
+              body: (comment_body)))
+    (comment
+      body: (comment_body))
+    item: (symbol)
+    (comment
+      body: (comment_body)))
+  (comment
+    body: (comment_body)))
+
+===
+unquote_splice reader macro
+===
+
+`(concat ,@xs)
+`(+ ,@(map f xs) ,extra)
+
+---
+
+(program
+  (quasi_quote_reader_macro
+    expression: (list
+                  call: (symbol)
+                  item: (unquote_splice_reader_macro
+                          expression: (symbol))))
+  (quasi_quote_reader_macro
+    expression: (list
+                  call: (symbol)
+                  item: (unquote_splice_reader_macro
+                          expression: (list
+                                        call: (symbol)
+                                        item: (symbol)
+                                        item: (symbol)))
+                  item: (unquote_reader_macro
+                          expression: (symbol)))))
+
+===
+reader macros
+===
+
+'[]
+`123
+`(+ ,a ,b)
+`("")
+'(bleh)
+#(+ $1 $2)
+#$3
+#[$1 $2 $3]
+#$
+#val
+#{: one : two}
+
+---
+
+(program
+  (quote_reader_macro
+    expression: (sequence))
+  (quasi_quote_reader_macro
+    expression: (number))
+  (quasi_quote_reader_macro
+    expression: (list
+                  call: (symbol)
+                  item: (unquote_reader_macro
+                          expression: (symbol))
+                  item: (unquote_reader_macro
+                          expression: (symbol))))
+  (quasi_quote_reader_macro
+    expression: (list
+                  call: (string)))
+  (quote_reader_macro
+    expression: (list
+                  call: (symbol)))
+  (hashfn_reader_macro
+    expression: (list
+                  call: (symbol)
+                  item: (symbol)
+                  item: (symbol)))
+  (hashfn_reader_macro
+    expression: (symbol))
+  (hashfn_reader_macro
+    expression: (sequence
+                  item: (symbol)
+                  item: (symbol)
+                  item: (symbol)))
+  (hashfn_reader_macro
+    expression: (symbol))
+  (hashfn_reader_macro
+    expression: (symbol))
+  (hashfn_reader_macro
+    expression: (table
+                  item: (table_pair
+                          key: (symbol)
+                          value: (symbol))
+                  item: (table_pair
+                          key: (symbol)
+                          value: (symbol)))))
