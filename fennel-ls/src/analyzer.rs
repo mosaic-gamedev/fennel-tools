@@ -328,7 +328,7 @@ impl Analyzer {
                 if forms.len() >= 2 { self.analyze(&forms[1]); }
                 self.analyze_do(&forms[2..], list_span);
             }
-            Some("while") => self.analyze_while(forms),
+            Some("while") => self.analyze_while(forms, list_span),
             Some("each") => self.analyze_each(forms, list_span),
             Some("for") => self.analyze_for(forms, list_span),
             Some("macro") => self.analyze_macro_def(forms, list_span),
@@ -339,7 +339,8 @@ impl Analyzer {
             // collect / icollect / accumulate / faccumulate are iterator macros
             Some("collect") | Some("icollect") => self.analyze_collect(forms, list_span),
             Some("fcollect") => self.analyze_fcollect(forms, list_span),
-            Some("accumulate") | Some("faccumulate") => self.analyze_accumulate(forms, list_span),
+            Some("accumulate") => self.analyze_accumulate(forms, list_span),
+            Some("faccumulate") => self.analyze_faccumulate(forms, list_span),
             Some("with-open") => self.analyze_with_open(forms, list_span),
             Some("as->") => self.analyze_as_arrow(forms, list_span),
             // Anything else: analyze head + args, then check arity
@@ -570,8 +571,14 @@ impl Analyzer {
 
     // ── (while cond body...) ──────────────────────────────────────────────────
 
-    fn analyze_while(&mut self, forms: &[AstNode]) {
-        self.analyze_forms(&forms[1..]);
+    fn analyze_while(&mut self, forms: &[AstNode], list_span: &Span) {
+        // (while condition body...)
+        // Condition is in the outer scope; body gets its own scope.
+        if forms.len() < 2 { return; }
+        self.analyze(&forms[1]);
+        self.push_scope(list_span.clone());
+        self.analyze_forms(&forms[2..]);
+        self.pop_scope();
     }
 
     // ── (each [k v iter] body...) ─────────────────────────────────────────────
@@ -873,6 +880,37 @@ impl Analyzer {
                 }
 
                 // Analyze the &until guard (its condition can reference loop vars)
+                if let Some(p) = until_pos {
+                    if p + 1 < binds.len() {
+                        self.analyze(&binds[p + 1]);
+                    }
+                }
+            }
+        }
+        self.analyze_forms(&forms[2..]);
+        self.pop_scope();
+    }
+
+    fn analyze_faccumulate(&mut self, forms: &[AstNode], list_span: &Span) {
+        // (faccumulate [acc init var start stop step? &until cond?] body)
+        // Unlike accumulate, the range elements (start/stop/step) are numeric
+        // expressions, not loop-var patterns — they must be analyzed, not bound.
+        if forms.len() < 2 { return; }
+        self.push_scope(list_span.clone());
+        if let Form::Sequence(binds) = &forms[1].node {
+            if binds.len() >= 5 {
+                let until_pos = binds.iter().position(|b| {
+                    matches!(&b.node, Form::Symbol(s) if s == "&until")
+                });
+                let range_end = until_pos.unwrap_or(binds.len());
+                // Analyze init before binding acc
+                self.analyze(&binds[1]);
+                self.bind_pattern(&binds[0], DefKind::Local);
+                // Analyze start/stop/step before binding the loop var
+                for expr in &binds[3..range_end] {
+                    self.analyze(expr);
+                }
+                self.bind_pattern(&binds[2], DefKind::LoopVar);
                 if let Some(p) = until_pos {
                     if p + 1 < binds.len() {
                         self.analyze(&binds[p + 1]);
@@ -2003,6 +2041,35 @@ mod tests {
     }
 
     #[test]
+    fn faccumulate_variable_start_stop_analyzed_as_exprs() {
+        let r = analyze_src("(local lo 1) (local hi 10) (faccumulate [sum 0 i lo hi] (+ sum i))");
+        assert!(!is_unknown(&r, "lo"), "start must be analyzed as an expression");
+        assert!(!is_unknown(&r, "hi"), "stop must be analyzed as an expression");
+        assert!(!is_unknown(&r, "i"), "loop var must be visible in body");
+        assert!(!is_unknown(&r, "sum"), "acc must be visible in body");
+    }
+
+    #[test]
+    fn faccumulate_variable_step_analyzed_as_expr() {
+        let r = analyze_src("(local step 2) (faccumulate [sum 0 i 1 10 step] (+ sum i))");
+        assert!(!is_unknown(&r, "step"), "step must be analyzed as an expression");
+        assert!(!is_unknown(&r, "i"));
+    }
+
+    #[test]
+    fn faccumulate_until_guard_sees_loop_var() {
+        let r = analyze_src("(faccumulate [sum 0 i 1 100 &until (> sum 50)] (+ sum i))");
+        assert!(!is_unknown(&r, "i"), "loop var must be visible in &until guard");
+        assert!(!is_unknown(&r, "sum"), "acc must be visible in &until guard");
+    }
+
+    #[test]
+    fn faccumulate_acc_not_visible_outside() {
+        let r = analyze_src("(faccumulate [sum 0 i 1 10] (+ sum i)) sum");
+        assert!(is_unknown(&r, "sum"), "acc must not leak outside faccumulate");
+    }
+
+    #[test]
     fn lambda_creates_fn_def() {
         let r = analyze_src("(lambda greet [name] name)");
         assert_eq!(def_kind(&r, "greet"), Some(DefKind::Fn));
@@ -2103,9 +2170,35 @@ mod tests {
 
     #[test]
     fn when_body_refs_resolve() {
-        // Refs inside the when body can see outer bindings.
         let r = analyze_src("(local x 1) (when true x)");
         assert!(ref_resolves(&r, "x"), "body ref to outer binding must resolve");
+    }
+
+    // ── while ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn while_condition_refs_resolve() {
+        let r = analyze_src("(local n 10) (while (> n 0) nil)");
+        assert!(!is_unknown(&r, "n"), "condition must see outer bindings");
+    }
+
+    #[test]
+    fn while_body_refs_resolve() {
+        let r = analyze_src("(local x 1) (while true (print x))");
+        assert!(!is_unknown(&r, "x"), "body must see outer bindings");
+    }
+
+    #[test]
+    fn while_body_binding_not_visible_after_while() {
+        let r = analyze_src("(while true (local inner 1)) inner");
+        assert!(is_unknown(&r, "inner"), "while body binding must not leak outside");
+    }
+
+    #[test]
+    fn while_body_multiple_forms_all_analyzed() {
+        let r = analyze_src("(local a 1) (local b 2) (while true (print a) (print b))");
+        assert!(!is_unknown(&r, "a"));
+        assert!(!is_unknown(&r, "b"));
     }
 
     // ── Global scope limitation ───────────────────────────────────────────────
