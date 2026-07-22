@@ -111,7 +111,7 @@ impl AnalysisResult {
         while let Some(idx) = scope_idx {
             let scope = &self.scopes[idx];
             for (name, &def_byte) in &scope.bindings {
-                if seen.insert(name.clone()) {
+                if def_byte <= byte && seen.insert(name.clone()) {
                     if let Some(def) = self.defs.get(&def_byte) {
                         result.push(def);
                     }

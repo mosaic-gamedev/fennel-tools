@@ -24,7 +24,7 @@ pub struct Backend {
     /// Populated from `known_globals` plus roots inferred from `global_docs` keys.
     extra_globals: OnceLock<HashSet<String>>,
     /// Per-symbol hover docs loaded from `global_docs` (inline or via `include`).
-    /// Keys are exact Fennel symbol names, e.g. `"Mosaic.Grid.set_tile"`.
+    /// Keys are exact Fennel symbol names, e.g. `"MyLib.module.fn"`.
     global_docs: OnceLock<HashMap<String, GlobalDoc>>,
 }
 
@@ -168,6 +168,13 @@ impl LanguageServer for Backend {
                     ]),
                     ..Default::default()
                 }),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), " ".into()]),
+                    retrigger_characters: None,
+                    work_done_progress_options: Default::default(),
+                }),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -285,11 +292,10 @@ impl LanguageServer for Backend {
             }
 
             // Custom global docs from `.fennel-ls.toml` / included files.
-            // Try the full name first (e.g. "Mosaic.Grid.set_tile"), then
-            // progressively strip trailing members until a match is found or
-            // the chain is exhausted.  This lets a single "Mosaic.Grid" entry
-            // serve as a fallback for any Mosaic.Grid.* call with no specific
-            // entry.
+            // Try the full name first, then progressively strip trailing
+            // members until a match is found or the chain is exhausted.
+            // This lets a parent namespace entry serve as a fallback for
+            // any child call with no specific entry.
             if let Some(docs) = self.global_docs.get() {
                 let mut key: &str = &name;
                 loop {
@@ -493,6 +499,7 @@ impl LanguageServer for Backend {
 
         let result = self.workspace.with_file(uri, |file| {
             let byte = text::position_to_byte(&file.text, pos).unwrap_or(0) as u32;
+            let multisym_prefix = multisym_prefix_at(&file.text, byte as usize);
 
             let mut items: Vec<CompletionItem> = Vec::new();
             let mut seen = std::collections::HashSet::new();
@@ -546,11 +553,12 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Custom global docs — surface every documented name as a
-            // completion candidate so editors can offer e.g. "Mosaic.Grid.set_tile"
-            // when the user starts typing the namespace.
+            // Custom global docs, filtered to the current multisym prefix if any.
             if let Some(docs) = self.global_docs.get() {
                 for (name, doc) in docs {
+                    if let Some(ref pfx) = multisym_prefix {
+                        if !name.starts_with(pfx.as_str()) { continue; }
+                    }
                     if seen.insert(name.clone()) {
                         items.push(CompletionItem {
                             label: name.clone(),
@@ -683,6 +691,82 @@ impl LanguageServer for Backend {
         Ok(if actions.is_empty() { None } else { Some(actions) })
     }
 
+    // ── Folding ranges ────────────────────────────────────────────────────────
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = &params.text_document.uri;
+        let result = self.workspace.with_file(uri, |file| {
+            let mut ranges = Vec::new();
+            for node in &file.ast {
+                collect_folds(node, &file.text, &mut ranges);
+            }
+            ranges
+        });
+        Ok(result)
+    }
+
+    // ── Signature help ────────────────────────────────────────────────────────
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> Result<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let result = self.workspace.with_file(uri, |file| {
+            let byte = text::position_to_byte(&file.text, pos)? as u32;
+            let (head_byte, arg_index) = enclosing_call(&file.ast, byte)?;
+            let sym = file.analysis.symbol_at(head_byte)?;
+            let def = file.analysis.defs.get(&sym.def_byte?)?;
+            let params_list = def.params.as_ref()?;
+            let label = format!("({} {})", def.name, params_list.join(" "));
+            let parameters: Vec<ParameterInformation> = params_list
+                .iter()
+                .map(|p| ParameterInformation {
+                    label: ParameterLabel::Simple(p.clone()),
+                    documentation: None,
+                })
+                .collect();
+            let active = arg_index.min(parameters.len().saturating_sub(1)) as u32;
+            Some(SignatureHelp {
+                signatures: vec![SignatureInformation {
+                    label,
+                    documentation: def.doc.as_ref().map(|d| {
+                        Documentation::MarkupContent(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: d.clone(),
+                        })
+                    }),
+                    parameters: Some(parameters),
+                    active_parameter: Some(active),
+                }],
+                active_signature: Some(0),
+                active_parameter: Some(active),
+            })
+        });
+        Ok(result.flatten())
+    }
+
+    // ── Inlay hints ───────────────────────────────────────────────────────────
+
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let result = self.workspace.with_file(uri, |file| {
+            let mut hints = Vec::new();
+            for node in &file.ast {
+                collect_inlay_hints(node, &file.text, &file.analysis, &mut hints);
+            }
+            hints
+        });
+        Ok(result)
+    }
+
     // ── Semantic tokens ───────────────────────────────────────────────────────
 
     async fn semantic_tokens_full(
@@ -713,6 +797,164 @@ fn platform_from_str(s: &str) -> Option<Platform> {
         "luau" => Some(Platform::Luau),
         _ => None,
     }
+}
+
+/// Walk the AST and emit a FoldingRange for every multi-line list/sequence/table.
+fn collect_folds(node: &crate::parser::AstNode, text: &str, out: &mut Vec<FoldingRange>) {
+    let children: &[crate::parser::AstNode] = match &node.node {
+        Form::List(c) | Form::Sequence(c) | Form::Table(c) => c,
+        Form::Quote(inner) | Form::Quasiquote(inner)
+        | Form::Unquote(inner) | Form::UnquoteSplice(inner)
+        | Form::HashFn(inner) => {
+            collect_folds(inner, text, out);
+            return;
+        }
+        _ => return,
+    };
+    let start_line = text::byte_to_position(text, node.span.start as usize).line;
+    let end_line   = text::byte_to_position(text, node.span.end   as usize).line;
+    if end_line > start_line {
+        out.push(FoldingRange {
+            start_line,
+            end_line,
+            start_character: None,
+            end_character: None,
+            kind: Some(FoldingRangeKind::Region),
+            collapsed_text: None,
+        });
+    }
+    for child in children {
+        collect_folds(child, text, out);
+    }
+}
+
+/// Return the byte offset of the head symbol and the 0-based active-parameter
+/// index for the innermost function-call list that contains `byte`.
+fn enclosing_call(
+    ast: &[crate::parser::AstNode],
+    byte: u32,
+) -> Option<(u32, usize)> {
+    fn walk(
+        node: &crate::parser::AstNode,
+        byte: u32,
+        best: &mut Option<(u32, usize, u32)>, // (head_byte, arg_idx, span_width)
+    ) {
+        if node.span.start > byte || node.span.end < byte {
+            return;
+        }
+        if let Form::List(children) = &node.node {
+            if let Some(head) = children.first() {
+                if matches!(&head.node, Form::Symbol(_)) {
+                    let arg_index = children[1..]
+                        .iter()
+                        .take_while(|c| c.span.end < byte)
+                        .count();
+                    let width = node.span.end - node.span.start;
+                    match best {
+                        None => *best = Some((head.span.start, arg_index, width)),
+                        Some((_, _, bw)) if width < *bw => {
+                            *best = Some((head.span.start, arg_index, width));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for child in children {
+                walk(child, byte, best);
+            }
+        }
+        match &node.node {
+            Form::Sequence(c) | Form::Table(c) => {
+                for child in c { walk(child, byte, best); }
+            }
+            Form::Quote(i) | Form::Quasiquote(i)
+            | Form::Unquote(i) | Form::UnquoteSplice(i)
+            | Form::HashFn(i) => walk(i, byte, best),
+            _ => {}
+        }
+    }
+    let mut best = None;
+    for node in ast {
+        walk(node, byte, &mut best);
+    }
+    best.map(|(hb, ai, _)| (hb, ai))
+}
+
+/// Walk the AST and emit an inlay hint for each argument of every call to a
+/// locally-defined function whose params are known.
+fn collect_inlay_hints(
+    node: &crate::parser::AstNode,
+    text: &str,
+    analysis: &crate::analyzer::AnalysisResult,
+    out: &mut Vec<InlayHint>,
+) {
+    let children: &[crate::parser::AstNode] = match &node.node {
+        Form::List(c) => c,
+        Form::Sequence(c) | Form::Table(c) => {
+            for child in c { collect_inlay_hints(child, text, analysis, out); }
+            return;
+        }
+        Form::Quote(i) | Form::Quasiquote(i)
+        | Form::Unquote(i) | Form::UnquoteSplice(i)
+        | Form::HashFn(i) => {
+            collect_inlay_hints(i, text, analysis, out);
+            return;
+        }
+        _ => return,
+    };
+    // Try to resolve the head to a function with known params
+    if let Some(head) = children.first() {
+        if let Some(sym) = analysis.symbol_at(head.span.start) {
+            if let Some(def_byte) = sym.def_byte {
+                if let Some(def) = analysis.defs.get(&def_byte) {
+                    if let Some(params) = &def.params {
+                        for (i, arg) in children[1..].iter().enumerate() {
+                            if let Some(param) = params.get(i) {
+                                // Skip rest param and underscore params
+                                if param.starts_with('&') || param.starts_with('_') {
+                                    continue;
+                                }
+                                let pos = text::byte_to_position(text, arg.span.start as usize);
+                                out.push(InlayHint {
+                                    position: pos,
+                                    label: InlayHintLabel::String(format!("{}:", param)),
+                                    kind: Some(InlayHintKind::PARAMETER),
+                                    text_edits: None,
+                                    tooltip: None,
+                                    padding_left: None,
+                                    padding_right: Some(true),
+                                    data: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for child in children {
+        collect_inlay_hints(child, text, analysis, out);
+    }
+}
+
+/// Extract a multisym namespace prefix from the text immediately before `byte`.
+/// e.g. if text before cursor is `Lib.module.` → returns `Some("Lib.module.")`
+fn multisym_prefix_at(text: &str, byte: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = byte;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+            || b == b'?' || b == b'!' || b == b'.' || b == b':'
+        {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    let token = &text[i..byte];
+    let last_sep = token.rfind(|c| c == '.' || c == ':')?;
+    Some(token[..=last_sep].to_string())
 }
 
 /// Apply a list of (possibly incremental) LSP content-change events to `text`
@@ -1289,5 +1531,242 @@ mod tests {
         assert!(matches!(platform_from_str("luau"), Some(Platform::Luau)));
         assert!(platform_from_str("lua99").is_none());
         assert!(platform_from_str("").is_none());
+    }
+
+    // ── Completion (defs_at) ──────────────────────────────────────────────────
+
+    fn completion_names_at(src: &str, byte: u32) -> Vec<String> {
+        let analysis = analyze(src);
+        analysis.defs_at(byte).into_iter().map(|d| d.name.clone()).collect()
+    }
+
+    #[test]
+    fn completion_includes_locals_in_scope() {
+        let src = "(local foo 1) (local bar 2) |";
+        //                                             ^ byte = src.len()-1
+        let byte = src.len() as u32 - 1;
+        let names = completion_names_at(src, byte);
+        assert!(names.contains(&"foo".to_string()), "foo must appear in completions");
+        assert!(names.contains(&"bar".to_string()), "bar must appear in completions");
+    }
+
+    #[test]
+    fn completion_includes_fn_params_inside_fn() {
+        // Cursor is inside the fn body (after the opening of print call)
+        let src = "(fn greet [name age] (print name))";
+        // byte inside the body — just before the closing paren
+        let byte = src.len() as u32 - 2;
+        let names = completion_names_at(src, byte);
+        assert!(names.contains(&"name".to_string()), "param `name` must be offered");
+        assert!(names.contains(&"age".to_string()),  "param `age` must be offered");
+    }
+
+    #[test]
+    fn completion_excludes_locals_not_yet_in_scope() {
+        // `bar` is defined after the cursor position
+        let src = "(local foo 1) | (local bar 2)";
+        let byte = src.find('|').unwrap() as u32;
+        let src = src.replace('|', " ");
+        let names = completion_names_at(&src, byte);
+        assert!(names.contains(&"foo".to_string()), "foo is before cursor — must appear");
+        assert!(!names.contains(&"bar".to_string()), "bar is after cursor — must not appear");
+    }
+
+    #[test]
+    fn completion_excludes_params_outside_fn() {
+        let src = "(fn f [x] x) |";
+        let byte = src.len() as u32 - 1;
+        let names = completion_names_at(src, byte);
+        assert!(!names.contains(&"x".to_string()), "param must not leak outside fn");
+    }
+
+    #[test]
+    fn completion_includes_loop_var_inside_for() {
+        let src = "(for [i 1 10] |)";
+        let byte = src.find('|').unwrap() as u32;
+        let src = src.replace('|', "i");
+        let names = completion_names_at(&src, byte);
+        assert!(names.contains(&"i".to_string()), "loop var must be offered inside for body");
+    }
+
+    #[test]
+    fn completion_no_duplicates() {
+        let src = "(local x 1) (local x 2) |";
+        let byte = src.len() as u32 - 1;
+        let names = completion_names_at(src, byte);
+        let x_count = names.iter().filter(|n| n.as_str() == "x").count();
+        assert_eq!(x_count, 1, "shadowed name must appear exactly once");
+    }
+
+    // ── multisym_prefix_at ────────────────────────────────────────────────────
+
+    #[test]
+    fn multisym_prefix_single_dot() {
+        assert_eq!(multisym_prefix_at("(Lib.", 5), Some("Lib.".into()));
+    }
+
+    #[test]
+    fn multisym_prefix_nested_dot() {
+        assert_eq!(multisym_prefix_at("(Lib.mod.", 9), Some("Lib.mod.".into()));
+    }
+
+    #[test]
+    fn multisym_prefix_colon_method() {
+        assert_eq!(multisym_prefix_at("(obj:", 5), Some("obj:".into()));
+    }
+
+    #[test]
+    fn multisym_prefix_partial_name_after_dot() {
+        // "Lib.fo" — cursor mid-word after dot, prefix is still "Lib."
+        assert_eq!(multisym_prefix_at("(Lib.fo", 7), Some("Lib.".into()));
+    }
+
+    #[test]
+    fn multisym_prefix_no_separator_returns_none() {
+        assert_eq!(multisym_prefix_at("(foo", 4), None);
+    }
+
+    #[test]
+    fn multisym_prefix_empty_returns_none() {
+        assert_eq!(multisym_prefix_at("", 0), None);
+    }
+
+    // ── collect_folds ─────────────────────────────────────────────────────────
+
+    fn folds_for(src: &str) -> Vec<FoldingRange> {
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let mut ranges = Vec::new();
+        for node in &ast {
+            collect_folds(node, src, &mut ranges);
+        }
+        ranges
+    }
+
+    #[test]
+    fn folding_multiline_list_produces_fold() {
+        let src = "(fn foo []\n  (+ 1 2))";
+        let ranges = folds_for(src);
+        assert_eq!(ranges.len(), 1, "one multiline list → one fold");
+        assert_eq!(ranges[0].start_line, 0);
+        assert_eq!(ranges[0].end_line, 1);
+    }
+
+    #[test]
+    fn folding_single_line_no_fold() {
+        let src = "(fn foo [] (+ 1 2))";
+        assert!(folds_for(src).is_empty(), "single-line list must not fold");
+    }
+
+    #[test]
+    fn folding_nested_multiline_both_fold() {
+        let src = "(fn foo []\n  (let [x 1]\n    x))";
+        let ranges = folds_for(src);
+        assert_eq!(ranges.len(), 2, "outer fn and inner let both span multiple lines");
+    }
+
+    #[test]
+    fn folding_sequence_folds_when_multiline() {
+        let src = "(local x [\n  1\n  2])";
+        let ranges = folds_for(src);
+        assert!(ranges.iter().any(|r| r.start_line < r.end_line),
+            "multiline sequence must produce a fold");
+    }
+
+    // ── enclosing_call ────────────────────────────────────────────────────────
+
+    #[test]
+    fn enclosing_call_finds_head_byte() {
+        let src = "(foo 1 2)";
+        let ast = parse_ast(src);
+        // cursor anywhere inside the call
+        let (head_byte, _) = enclosing_call(&ast, 5).expect("must find enclosing call");
+        // head `foo` starts at byte 1
+        assert_eq!(head_byte, 1);
+    }
+
+    #[test]
+    fn enclosing_call_arg_index_first_arg() {
+        let src = "(foo aaa bbb)";
+        let ast = parse_ast(src);
+        // cursor on `aaa` (byte 5)
+        let (_, arg_idx) = enclosing_call(&ast, 5).unwrap();
+        assert_eq!(arg_idx, 0, "cursor on first arg → active param 0");
+    }
+
+    #[test]
+    fn enclosing_call_arg_index_second_arg() {
+        let src = "(foo aaa bbb)";
+        let ast = parse_ast(src);
+        // cursor on `bbb` (byte 9)
+        let (_, arg_idx) = enclosing_call(&ast, 9).unwrap();
+        assert_eq!(arg_idx, 1, "cursor on second arg → active param 1");
+    }
+
+    #[test]
+    fn enclosing_call_innermost_wins() {
+        let src = "(outer (inner 1))";
+        let ast = parse_ast(src);
+        // cursor on `1` — should resolve to `inner`, not `outer`
+        let (head_byte, _) = enclosing_call(&ast, 14).unwrap();
+        // `inner` starts at byte 8
+        assert_eq!(head_byte, 8);
+    }
+
+    #[test]
+    fn enclosing_call_bare_symbol_returns_none() {
+        let ast = parse_ast("foo");
+        assert!(enclosing_call(&ast, 1).is_none());
+    }
+
+    // ── collect_inlay_hints ───────────────────────────────────────────────────
+
+    fn inlay_hint_labels(src: &str) -> Vec<String> {
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let analysis = crate::analyzer::analyze(&ast);
+        let mut hints = Vec::new();
+        for node in &ast {
+            collect_inlay_hints(node, src, &analysis, &mut hints);
+        }
+        hints.into_iter().map(|h| match h.label {
+            InlayHintLabel::String(s) => s,
+            _ => String::new(),
+        }).collect()
+    }
+
+    #[test]
+    fn inlay_hints_emitted_for_known_fn() {
+        let labels = inlay_hint_labels("(fn add [a b] (+ a b)) (add 1 2)");
+        assert!(labels.contains(&"a:".to_string()));
+        assert!(labels.contains(&"b:".to_string()));
+    }
+
+    #[test]
+    fn inlay_hints_skip_rest_param() {
+        let labels = inlay_hint_labels("(fn f [a & rest] a) (f 1 2 3)");
+        assert!(labels.contains(&"a:".to_string()), "first named param gets a hint");
+        assert!(!labels.iter().any(|l| l.contains('&')), "rest param must not emit a hint");
+    }
+
+    #[test]
+    fn inlay_hints_skip_underscore_param() {
+        let labels = inlay_hint_labels("(fn f [_ignored b] b) (f 1 2)");
+        assert!(!labels.iter().any(|l| l.starts_with('_')), "underscore param must not emit hint");
+        assert!(labels.contains(&"b:".to_string()), "named param after underscore still hints");
+    }
+
+    #[test]
+    fn inlay_hints_unknown_fn_no_hints() {
+        // Call to an unresolved function — no params known, no hints
+        let labels = inlay_hint_labels("(unknown-fn 1 2 3)");
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn inlay_hints_nested_calls_both_hinted() {
+        let src = "(fn add [a b] (+ a b)) (fn neg [x] (- x)) (add (neg 1) 2)";
+        let labels = inlay_hint_labels(src);
+        assert!(labels.contains(&"a:".to_string()));
+        assert!(labels.contains(&"b:".to_string()));
+        assert!(labels.contains(&"x:".to_string()));
     }
 }

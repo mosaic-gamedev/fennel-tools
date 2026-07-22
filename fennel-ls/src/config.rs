@@ -25,7 +25,7 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 pub struct GlobalDoc {
     /// Short fennel-style call signature shown in the hover code block.
-    /// Example: `"(Mosaic.Grid.set_tile col row index primary secondary rotation)"`
+    /// Example: `"(MyLib.module.fn arg1 arg2)"`
     pub signature: String,
     /// Prose description shown below the signature. Supports Markdown.
     pub doc: Option<String>,
@@ -63,15 +63,15 @@ pub struct Config {
 
     /// Inline documentation for global names (functions, namespaces, values).
     /// Keys are the exact Fennel symbol as it appears in source, including
-    /// dots for namespaced APIs (e.g. `"Mosaic.Grid.set_tile"`).
+    /// dots for namespaced APIs (e.g. `"MyLib.module.fn"`).
     ///
     /// Roots are extracted automatically and added to the known-globals set,
     /// so you do not need to repeat them in `known_globals`.
     ///
     /// Hover: the server does an exact-match lookup first, then strips
     /// trailing `.member` segments until it finds a match or exhausts the
-    /// chain.  This means a single `"Mosaic.Grid"` entry acts as a fallback
-    /// for any `Mosaic.Grid.*` call that has no specific entry.
+    /// chain.  This means a single parent namespace entry acts as a fallback
+    /// for any child call that has no specific entry.
     pub global_docs: Option<HashMap<String, GlobalDoc>>,
 }
 
@@ -167,14 +167,14 @@ known_globals = ["my_lib"]
     #[test]
     fn global_docs_inline_parsed() {
         let c = parse(r#"
-[global_docs."Mosaic.Grid.resize"]
-signature = "(Mosaic.Grid.resize cols rows)"
-doc = "Resize the grid."
+[global_docs."MyLib.module.fn"]
+signature = "(MyLib.module.fn cols rows)"
+doc = "Does something."
 "#);
         let docs = c.global_docs.unwrap();
-        let entry = docs.get("Mosaic.Grid.resize").unwrap();
-        assert_eq!(entry.signature, "(Mosaic.Grid.resize cols rows)");
-        assert_eq!(entry.doc.as_deref(), Some("Resize the grid."));
+        let entry = docs.get("MyLib.module.fn").unwrap();
+        assert_eq!(entry.signature, "(MyLib.module.fn cols rows)");
+        assert_eq!(entry.doc.as_deref(), Some("Does something."));
     }
 
     #[test]
