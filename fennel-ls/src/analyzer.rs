@@ -612,18 +612,22 @@ impl Analyzer {
     // ── (for [i start stop step?] body...) ────────────────────────────────────
 
     fn analyze_for(&mut self, forms: &[AstNode], list_span: &Span) {
-        // (for var start stop [step] body...)
-        // var is forms[1] directly — NOT wrapped in a Sequence.
-        if forms.len() < 4 {
+        // (for [var start stop step?] body...)
+        // The binding clause is always a Sequence at forms[1].
+        if forms.len() < 3 {
             return;
         }
         self.push_scope(list_span.clone());
-        // Analyze start and stop before binding (they must not reference the var)
-        self.analyze(&forms[2]);
-        self.analyze(&forms[3]);
-        self.bind_pattern(&forms[1], DefKind::LoopVar);
-        // Remaining forms: optional step, then body — var is in scope for all
-        self.analyze_forms(&forms[4..]);
+        if let Form::Sequence(binds) = &forms[1].node {
+            if binds.len() >= 3 {
+                // Analyze start, stop, and optional step before binding the var.
+                for expr in &binds[1..] {
+                    self.analyze(expr);
+                }
+                self.bind_pattern(&binds[0], DefKind::LoopVar);
+            }
+        }
+        self.analyze_forms(&forms[2..]);
         self.pop_scope();
     }
 
@@ -1559,36 +1563,32 @@ mod tests {
 
     #[test]
     fn for_binds_loop_var() {
-        let r = analyze_src("(for i 1 10 (print i))");
+        let r = analyze_src("(for [i 1 10] (print i))");
         assert_eq!(def_kind(&r, "i"), Some(DefKind::LoopVar));
         assert!(!is_unknown(&r, "i"));
     }
 
     #[test]
     fn for_var_in_scope_in_body() {
-        // i must be a resolved reference inside the body, not unknown
-        let r = analyze_src("(for i 1 5 (io.write (tostring i)))");
+        let r = analyze_src("(for [i 1 5] (io.write (tostring i)))");
         assert!(!is_unknown(&r, "i"), "loop var must be visible in body");
-        assert!(!is_unknown(&r, "i"), "body reference to i must resolve");
     }
 
     #[test]
     fn for_with_step_var_in_scope() {
-        // step is the 5th form; body still has i in scope
-        let r = analyze_src("(for i 0 100 10 (print i))");
+        let r = analyze_src("(for [i 0 100 10] (print i))");
         assert!(!is_unknown(&r, "i"), "loop var must be visible when step is present");
     }
 
     #[test]
     fn for_var_not_in_scope_outside() {
-        let r = analyze_src("(for i 1 3 nil) i");
+        let r = analyze_src("(for [i 1 3] nil) i");
         assert!(is_unknown(&r, "i"), "loop var must not leak outside for");
     }
 
     #[test]
     fn for_start_stop_analyzed() {
-        // start and stop are expressions; references inside them should resolve
-        let r = analyze_src("(local n 10) (for i 1 n (print i))");
+        let r = analyze_src("(local n 10) (for [i 1 n] (print i))");
         assert!(!is_unknown(&r, "n"), "stop expression must be analyzed");
     }
 
@@ -2270,10 +2270,8 @@ mod tests {
 
     #[test]
     fn for_step_expression_analyzed() {
-        // Step is the 5th form: (for var start stop step body...)
-        // It is analyzed inside the for scope, so outer locals must resolve.
-        let r = analyze_src("(local step 2) (for i 1 10 step (print i))");
-        assert!(!is_unknown(&r, "step"), "step variable must resolve in for body");
+        let r = analyze_src("(local step 2) (for [i 1 10 step] (print i))");
+        assert!(!is_unknown(&r, "step"), "step variable must resolve in for bindings");
         assert!(!is_unknown(&r, "i"), "loop var must be visible alongside step");
     }
 

@@ -79,7 +79,7 @@
   "Return a function that applies fns left-to-right (reverse compose)."
   (let [n        (length fns)
         reversed []]
-    (for idx 1 n 1
+    (for [idx 1 n 1]
       (table.insert reversed (. fns (- n idx -1))))
     (compose (table.unpack reversed))))
 
@@ -112,7 +112,7 @@
   (let [out {}]
     (each [k v (pairs t)]
       (tset out k v))
-    (for i 1 (length kvs) 2
+    (for [i 1 (length kvs) 2]
       (tset out (. kvs i) (. kvs (+ i 1))))
     out))
 
