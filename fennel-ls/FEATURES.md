@@ -5,9 +5,10 @@
 ## Implemented
 
 ### Text synchronisation
-Full-document sync (`TextDocumentSyncKind::FULL`). The entire file text is
-re-sent on every change. The lexer → parser → analyzer pipeline re-runs on
-each `didOpen`, `didChange`, and `didSave`.
+Incremental sync (`TextDocumentSyncKind::INCREMENTAL`). The client sends only
+the changed ranges; each change event is applied in sequence to the in-memory
+text, then the full pipeline re-runs. The lexer → parser → analyzer pipeline
+re-runs on each `didOpen`, `didChange`, and `didSave`.
 
 ### Diagnostics
 Pushed to the client after every sync event. Sources:
@@ -30,11 +31,17 @@ Multisym names (`io.open`, `obj:method`) are suppressed if the root (`io`,
   with a string literal.
 - **Built-in names:** renders the signature and description from `docs.rs`.
   Multisym lookup (`string.format`) resolves to the root entry (`string`).
+- **Cross-file module members:** `(local utils (require :utils))` followed by
+  hovering on `utils.greet` shows `greet`'s signature and docstring from
+  `utils.fnl`.
+- **Custom global docs:** signatures and docs from `global_docs` entries in
+  `.fennel-ls.toml` (see Configuration).
 
 ### Go to definition
-Jumps to the binding site of the symbol under the cursor. Single-file only.
-When the cursor is on the module string inside `(require :mod)` or
-`(import-macros … :mod)`, jumps to the resolved `.fnl` file on disk.
+Jumps to the binding site of the symbol under the cursor.
+- **Same-file:** resolves to the definition in the current file.
+- **Module members:** `utils.greet` → jumps to `greet`'s definition in `utils.fnl`.
+- **Require strings:** cursor on `:utils` inside `(require :utils)` → opens `utils.fnl`.
 
 ### Find references
 Returns all use-sites of whichever definition the cursor is on (or the
@@ -52,11 +59,6 @@ Lists every definition in the file (`local`, `var`, `global`, `fn`, `macro`,
 ### Rename
 Renames all occurrences of a symbol within the current file. Single-file only.
 
-### Text sync
-Incremental (`TextDocumentSyncKind::INCREMENTAL`). The client sends only the
-changed ranges; each change event is applied in sequence to the in-memory
-text, then the full pipeline re-runs. Network overhead is proportional to the
-edit, not the file size.
 
 ### Semantic tokens (`textDocument/semanticTokens/full`)
 Per-token classification for richer editor highlighting beyond what a static
@@ -84,10 +86,28 @@ Triggered on `(`, `[`, `{`, `.`, `:`.
 - Scope-local definitions, respecting lexical scope at the cursor position,
   with param and docstring info where available.
 - All built-ins from the active `BuiltinSet`.
+- **Cross-file module members:** typing `utils.` after `(local utils (require :utils))`
+  offers all top-level exports from `utils.fnl` with labels like `utils.greet`.
+- Custom global docs from `.fennel-ls.toml` filtered to the current multisym prefix.
 - Deduplicated by name (innermost binding wins). Sorted alphabetically.
 - `CompletionItemKind` follows `DefKind` (Fn → FUNCTION, Macro → KEYWORD,
   LoopVar/Param → VARIABLE, etc.) and `BuiltinKind` (Function → FUNCTION,
   SpecialForm/Macro → KEYWORD, Value → MODULE).
+
+### Folding ranges (`textDocument/foldingRange`)
+Multi-line lists, sequences, and tables each produce a folding region. Nested
+structures each fold independently.
+
+### Signature help (`textDocument/signatureHelp`)
+Shows the parameter list of the function being called as the user types
+arguments. Triggered on `(` and space. The active parameter is highlighted as
+the cursor moves through the argument positions. Only fires when the head
+symbol resolves to a user-defined `fn` with a known parameter list.
+
+### Inlay hints (`textDocument/inlayHint`)
+Parameter-name hints at call sites — shows which parameter each positional
+argument maps to (e.g. `a:` before the first argument). Suppressed for
+`_`-prefixed parameters (conventional discard) and rest parameters (`& rest`).
 
 ### Code actions
 - **`var → local` quickfix:** when a `var` binding was never mutated, rewrite the `var` keyword to `local`.
@@ -97,36 +117,28 @@ Triggered on `(`, `[`, `{`, `.`, `:`.
 
 ## Should be implemented
 
-### Multi-file / cross-file analysis
-The biggest missing piece. `(require :mod)` and `(import-macros {: f} :mod)`
-are parsed but their targets are never loaded, so imported names appear as
-unknown-identifier warnings. See `ARCHITECTURE.md` for a detailed
-implementation plan (dependency graph, exports index, BFS invalidation).
-Cross-file go-to-def, references, and rename all follow from this.
-
 ### Workspace symbols (`workspace/symbol`)
 Search all open (or project-wide) files for definitions matching a query
-string. Straightforward once the dependency graph from cross-file analysis
-exists; useful even before that as a search across open files.
-
-### Signature help (`textDocument/signatureHelp`)
-Show the parameter list of the function being called as the user types
-arguments. When the analyzer resolves the head of a list to a `DefKind::Fn`
-def that has a `params` list, emit a `SignatureInformation` response. Trigger
-characters: `(` and `,` (Fennel uses commas as whitespace, but `,` still
-commonly precedes an argument).
+string. Straightforward extension of the per-file document-symbol handler;
+cross-file require resolution means the dependency graph already exists.
 
 ### Formatting (`textDocument/formatting`)
 A pretty-printer that walks `Vec<AstNode>` and emits canonically indented
-Fennel. Adds real value for teams with mixed editors. Implementation in a new
-`src/fmt.rs`. The lexer already records line/col for every token; comment
-tokens can be interleaved with AST nodes to preserve them.
+Fennel. Implementation in a new `src/fmt.rs`. The lexer already records
+line/col for every token; comment tokens can be interleaved with AST nodes to
+preserve them.
 
 ### Macro expansion at call sites
 Macros introduce names into the caller's scope that the static analyzer
 cannot see. The right long-term fix is to spawn `fennel --expand` on a call
 site and parse the result. A feature flag can gate this on the presence of
-Fennel on `PATH`. See `ARCHITECTURE.md` for details.
+Fennel on `PATH`.
+
+### Cross-file references and rename
+Find-references and rename currently operate within the current file only.
+Extending them cross-file requires scanning all files that transitively
+require the file containing the renamed definition — the require_cache already
+has the per-file module graph needed to compute this set.
 
 ---
 
@@ -147,10 +159,8 @@ call sites for things like `(each [_ f (ipairs handlers)] (f))`. The feature
 would have low signal and high noise.
 
 ### Inlay hints for types
-No type system to infer from. The only inlay hints that would be meaningful
-are parameter-name hints at call sites (showing which param each argument
-maps to), which are useful but lower priority than signature help and can be
-deferred indefinitely.
+No type system to infer from. Parameter-name hints at call sites are
+implemented (see above); type-level hints have nothing to anchor to.
 
 ### `textDocument/implementation` and `textDocument/typeDefinition`
 These navigate from a type or interface declaration to its implementation, or

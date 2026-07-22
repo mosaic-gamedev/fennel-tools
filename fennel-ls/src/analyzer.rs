@@ -75,6 +75,8 @@ pub struct AnalysisResult {
     pub syms: Vec<SymbolEntry>,
     pub scopes: Vec<Scope>,
     pub warnings: Vec<AnalysisWarning>,
+    /// Maps local binding name → required module name for `(local x (require :mod))`.
+    pub module_bindings: HashMap<String, String>,
 }
 
 impl AnalysisResult {
@@ -137,6 +139,21 @@ impl AnalysisResult {
         }
         best.map(|(i, _)| i)
     }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// If `node` is `(require :mod)` or `(require "mod")`, return the module name.
+fn extract_require_module(node: &AstNode) -> Option<String> {
+    if let Form::List(forms) = &node.node {
+        if head_sym(forms) == Some("require") && forms.len() >= 2 {
+            return match &forms[1].node {
+                Form::Keyword(s) | Form::Str(s) => Some(s.clone()),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 // ── Analyzer ─────────────────────────────────────────────────────────────────
@@ -390,6 +407,12 @@ impl Analyzer {
         }
         // Evaluate RHS first (so it doesn't see the new binding)
         self.analyze(&forms[2]);
+        // Detect (local name (require :mod)) → record module binding
+        if let Form::Symbol(name) = &forms[1].node {
+            if let Some(module) = extract_require_module(&forms[2]) {
+                self.result.module_bindings.insert(name.clone(), module);
+            }
+        }
         self.bind_pattern(&forms[1], kind);
     }
 
@@ -2557,5 +2580,38 @@ mod tests {
     fn arity_recursive_call_no_false_warn() {
         // `(fn fact [n] (fact n))` — 1 arg, 1 param: no warning
         assert!(!has_warning("(fn fact [n] (fact n))", "argument"));
+    }
+
+    // ── module_bindings ───────────────────────────────────────────────────────
+
+    #[test]
+    fn module_binding_keyword_arg() {
+        let r = analyze_src("(local utils (require :my.mod))");
+        assert_eq!(r.module_bindings.get("utils").map(|s| s.as_str()), Some("my.mod"));
+    }
+
+    #[test]
+    fn module_binding_string_arg() {
+        let r = analyze_src(r#"(local utils (require "my.mod"))"#);
+        assert_eq!(r.module_bindings.get("utils").map(|s| s.as_str()), Some("my.mod"));
+    }
+
+    #[test]
+    fn module_binding_var_keyword() {
+        let r = analyze_src("(var lib (require :lib))");
+        assert_eq!(r.module_bindings.get("lib").map(|s| s.as_str()), Some("lib"));
+    }
+
+    #[test]
+    fn non_require_binding_not_recorded() {
+        let r = analyze_src("(local x 42)");
+        assert!(r.module_bindings.is_empty());
+    }
+
+    #[test]
+    fn destructured_binding_not_recorded_as_module() {
+        let r = analyze_src("(local {:foo foo} (require :mod))");
+        // Destructuring: forms[1] is a Table, not a Symbol — no module_bindings entry
+        assert!(r.module_bindings.is_empty());
     }
 }

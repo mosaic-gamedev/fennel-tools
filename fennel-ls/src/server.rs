@@ -216,8 +216,12 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
-        self.workspace
-            .update(doc.uri.clone(), doc.text, doc.version);
+        self.workspace.update(
+            doc.uri.clone(),
+            doc.text,
+            doc.version,
+            self.workspace_root.get().map(|p| p.as_path()),
+        );
         self.publish_diagnostics(doc.uri).await;
     }
 
@@ -231,7 +235,12 @@ impl LanguageServer for Backend {
             params.content_changes,
         );
 
-        self.workspace.update(uri.clone(), text, version);
+        self.workspace.update(
+            uri.clone(),
+            text,
+            version,
+            self.workspace_root.get().map(|p| p.as_path()),
+        );
         self.publish_diagnostics(uri).await;
     }
 
@@ -262,6 +271,25 @@ impl LanguageServer for Backend {
             let name = sym.name.clone();
             let span = sym.span.clone();
             let range = text::span_to_range(&file.text, &span);
+
+            // Cross-file hover: dotted multisym where root is a module binding.
+            // E.g. `utils.helper` → look up `helper` in the required `utils` module.
+            // Checked before the local def so module members take priority over
+            // the bare binding info for the root name.
+            if let Some((mod_root, member)) = split_multisym(&name) {
+                let member_root = member.split(['.', ':']).next().unwrap_or(member);
+                if let Some(def) = file.modules.get(mod_root)
+                    .and_then(|ex| ex.defs.get(member_root))
+                {
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format_definition(def),
+                        }),
+                        range: Some(range),
+                    });
+                }
+            }
 
             // User-defined definition
             if let Some(def_byte) = sym.def_byte {
@@ -334,16 +362,30 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
-        // Symbol go-to-def (existing)
+        // Symbol go-to-def: cross-file module members take priority over root binding.
         let result = self.workspace.with_file(uri, |file| {
             let byte = text::position_to_byte(&file.text, pos)? as u32;
             let sym = file.analysis.symbol_at(byte)?;
+
+            // Cross-file: `utils.helper` → jump to `helper` in utils.fnl
+            if let Some((mod_root, member)) = split_multisym(&sym.name) {
+                let member_root = member.split(['.', ':']).next().unwrap_or(member);
+                if let Some(exports) = file.modules.get(mod_root) {
+                    if let Some(def) = exports.defs.get(member_root) {
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: exports.uri.clone(),
+                            range: crate::text::span_to_range(&exports.text, &def.span),
+                        }));
+                    }
+                }
+            }
+
+            // Local def
             let def_byte = sym.def_byte?;
             let def = file.analysis.defs.get(&def_byte)?;
-
             Some(GotoDefinitionResponse::Scalar(Location {
                 uri: file.uri.clone(),
-                range: text::span_to_range(&file.text, &def.span),
+                range: crate::text::span_to_range(&file.text, &def.span),
             }))
         });
 
@@ -356,7 +398,7 @@ impl LanguageServer for Backend {
             let require_result = self.workspace.with_file(uri, |file| {
                 let byte = text::position_to_byte(&file.text, pos)? as u32;
                 let module = require_module_at(byte, &file.ast)?;
-                let path = resolve_require(&module, root)?;
+                let path = crate::workspace::resolve_require_path(&module, root)?;
                 let file_uri = Url::from_file_path(&path).ok()?;
                 Some(GotoDefinitionResponse::Scalar(Location {
                     uri: file_uri,
@@ -572,6 +614,38 @@ impl LanguageServer for Backend {
                             }),
                             ..Default::default()
                         });
+                    }
+                }
+            }
+
+            // Module binding completions: when prefix is `binding.`, offer exports.
+            // E.g. `(local utils (require :utils))` → typing `utils.` offers
+            // all top-level defs from utils.fnl with labels like `utils.helper`.
+            if let Some(ref pfx) = multisym_prefix {
+                for (binding, exports) in &file.modules {
+                    let expected_pfx = format!("{}.", binding);
+                    if !pfx.starts_with(&expected_pfx) { continue; }
+                    for (name, def) in &exports.defs {
+                        let full_label = format!("{}.{}", binding, name);
+                        if seen.insert(full_label.clone()) {
+                            items.push(CompletionItem {
+                                label: full_label,
+                                kind: Some(match def.kind {
+                                    DefKind::Fn | DefKind::Macro => CompletionItemKind::FUNCTION,
+                                    _ => CompletionItemKind::VARIABLE,
+                                }),
+                                detail: def.params.as_ref().map(|p| {
+                                    format!("fn [{}]", p.join(" "))
+                                }),
+                                documentation: def.doc.as_ref().map(|d| {
+                                    Documentation::MarkupContent(MarkupContent {
+                                        kind: MarkupKind::Markdown,
+                                        value: d.clone(),
+                                    })
+                                }),
+                                ..Default::default()
+                            });
+                        }
                     }
                 }
             }
@@ -1106,17 +1180,10 @@ fn require_module_at(byte: u32, ast: &[crate::parser::AstNode]) -> Option<String
     None
 }
 
-/// Resolve a Fennel module name (e.g. `"my.util"`) to a `.fnl` file path
-/// relative to `root`, following Fennel's standard search convention.
-fn resolve_require(module: &str, root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let rel = module.replace('.', "/");
-    for suffix in &[".fnl", "/init.fnl"] {
-        let candidate = root.join(format!("{rel}{suffix}"));
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+/// Split `name` on the first `.` or `:` separator.
+/// Returns `(root, rest)` or `None` if there is no separator.
+fn split_multisym(name: &str) -> Option<(&str, &str)> {
+    name.find(['.', ':']).map(|i| (&name[..i], &name[i + 1..]))
 }
 
 /// Common Lua globals not in our doc table that we shouldn't warn about.
@@ -1768,5 +1835,189 @@ mod tests {
         assert!(labels.contains(&"a:".to_string()));
         assert!(labels.contains(&"b:".to_string()));
         assert!(labels.contains(&"x:".to_string()));
+    }
+
+    // ── Cross-file require resolution (hover / goto-def / completion) ─────────
+    //
+    // These tests exercise the full pipeline: tempdir module file on disk →
+    // workspace.update() with root → handler logic pulling from file.modules.
+
+    /// Build a Workspace with `main_src` open as `file:///main.fnl`, resolving
+    /// requires against `root` (a tempdir path that may contain module files).
+    fn ws_with_require(root: &std::path::Path, main_src: &str) -> (Workspace, Url) {
+        let ws = Workspace::new();
+        let uri = Url::parse("file:///main.fnl").unwrap();
+        ws.update(uri.clone(), main_src.to_string(), 1, Some(root));
+        (ws, uri)
+    }
+
+    /// Return the hover markdown for the symbol at `(line, col)` in `uri`,
+    /// using only the cross-file module-member path (not builtins / global_docs).
+    fn module_hover_at(ws: &Workspace, uri: &Url, line: u32, col: u32) -> Option<String> {
+        ws.with_file(uri, |file| {
+            let byte = crate::text::position_to_byte(
+                &file.text,
+                tower_lsp::lsp_types::Position { line, character: col },
+            )? as u32;
+            let sym = file.analysis.symbol_at(byte)?;
+            let (mod_root, member) = split_multisym(&sym.name)?;
+            let member_root = member.split(['.', ':']).next().unwrap_or(member);
+            let def = file.modules.get(mod_root)?.defs.get(member_root)?;
+            Some(format_definition(def))
+        }).flatten()
+    }
+
+    /// Goto-def: return `(target_uri_filename, start_col)` for module member.
+    fn module_goto_def_at(ws: &Workspace, uri: &Url, line: u32, col: u32) -> Option<(String, u32)> {
+        ws.with_file(uri, |file| {
+            let byte = crate::text::position_to_byte(
+                &file.text,
+                tower_lsp::lsp_types::Position { line, character: col },
+            )? as u32;
+            let sym = file.analysis.symbol_at(byte)?;
+            let (mod_root, member) = split_multisym(&sym.name)?;
+            let member_root = member.split(['.', ':']).next().unwrap_or(member);
+            let exports = file.modules.get(mod_root)?;
+            let def = exports.defs.get(member_root)?;
+            let range = crate::text::span_to_range(&exports.text, &def.span);
+            let filename = exports.uri.path().split('/').last().unwrap_or("").to_string();
+            Some((filename, range.start.character))
+        }).flatten()
+    }
+
+    /// Completion: labels from module exports for a given multisym prefix.
+    fn module_completion_labels(ws: &Workspace, uri: &Url, line: u32, col: u32) -> Vec<String> {
+        ws.with_file(uri, |file| {
+            let byte = crate::text::position_to_byte(
+                &file.text,
+                tower_lsp::lsp_types::Position { line, character: col },
+            ).unwrap_or(0) as u32;
+            let pfx = multisym_prefix_at(&file.text, byte as usize)?;
+            let mut labels = Vec::new();
+            for (binding, exports) in &file.modules {
+                let expected = format!("{}.", binding);
+                if !pfx.starts_with(&expected) { continue; }
+                for name in exports.defs.keys() {
+                    labels.push(format!("{}.{}", binding, name));
+                }
+            }
+            labels.sort();
+            Some(labels)
+        }).flatten().unwrap_or_default()
+    }
+
+    #[test]
+    fn module_hover_shows_member_signature_and_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"),
+            r#"(fn greet [name] "Say hello." (.. "Hello, " name))"#).unwrap();
+        // line 0: "(local utils (require :utils))"
+        // line 1: "(utils.greet "world")"
+        //          0123456789012 — "utils.greet" starts at col 1
+        let src = "(local utils (require :utils))\n(utils.greet \"world\")";
+        let (ws, uri) = ws_with_require(dir.path(), src);
+        let hover = module_hover_at(&ws, &uri, 1, 5).unwrap();
+        assert!(hover.contains("fn greet [name]"), "signature should be in hover: {hover}");
+        assert!(hover.contains("Say hello."), "docstring should be in hover: {hover}");
+    }
+
+    #[test]
+    fn module_hover_none_for_non_module_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = "(local x 42) x";
+        let (ws, uri) = ws_with_require(dir.path(), src);
+        // `x` has no `.` separator — split_multisym returns None
+        let hover = module_hover_at(&ws, &uri, 0, 13);
+        assert!(hover.is_none());
+    }
+
+    #[test]
+    fn module_goto_def_jumps_to_module_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("geo.fnl"),
+            "(fn make-vec [x y] {:x x :y y})").unwrap();
+        // line 0: "(local geo (require :geo))"
+        // line 1: "(geo.make-vec 1 2)"
+        //          01234567890123
+        let src = "(local geo (require :geo))\n(geo.make-vec 1 2)";
+        let (ws, uri) = ws_with_require(dir.path(), src);
+        let (filename, _col) = module_goto_def_at(&ws, &uri, 1, 5).unwrap();
+        assert_eq!(filename, "geo.fnl", "should jump to geo.fnl, got: {filename}");
+    }
+
+    #[test]
+    fn module_goto_def_col_matches_def_position() {
+        let dir = tempfile::tempdir().unwrap();
+        // `helper` starts at col 4: "(fn helper [x] x)"
+        //                             0123456789
+        std::fs::write(dir.path().join("lib.fnl"), "(fn helper [x] x)").unwrap();
+        let src = "(local lib (require :lib))\n(lib.helper 42)";
+        let (ws, uri) = ws_with_require(dir.path(), src);
+        let (_file, col) = module_goto_def_at(&ws, &uri, 1, 5).unwrap();
+        assert_eq!(col, 4, "helper def starts at col 4 in lib.fnl");
+    }
+
+    #[test]
+    fn module_completion_offers_all_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("math.fnl"),
+            "(fn add [a b] (+ a b)) (fn sub [a b] (- a b))").unwrap();
+        // Cursor is right after "math." on line 1
+        // "(local math (require :math))\n(math."
+        //  0         1         2         0123456
+        let src = "(local math (require :math))\n(math.";
+        let (ws, uri) = ws_with_require(dir.path(), src);
+        let byte = src.len() as u32;
+        let labels = module_completion_labels(&ws, &uri, 1, 6);
+        assert!(labels.contains(&"math.add".to_string()), "add should be offered: {labels:?}");
+        assert!(labels.contains(&"math.sub".to_string()), "sub should be offered: {labels:?}");
+    }
+
+    #[test]
+    fn module_completion_empty_without_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn foo [] nil)").unwrap();
+        let src = "(local utils (require :utils))\n";
+        let (ws, uri) = ws_with_require(dir.path(), src);
+        // No "." in the text before cursor → no module completions
+        let labels = module_completion_labels(&ws, &uri, 1, 0);
+        assert!(labels.is_empty(), "no prefix → no module completions");
+    }
+
+    #[test]
+    fn module_diagnostics_no_unknown_identifier_for_member() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn helper [x] x)").unwrap();
+        let src = "(local utils (require :utils))\n(utils.helper 1)";
+        let (ws, uri) = ws_with_require(dir.path(), src);
+        let warnings: Vec<String> = ws.with_file(&uri, |f| {
+            f.analysis.warnings.iter().map(|w| w.message.clone()).collect()
+        }).unwrap_or_default();
+        assert!(
+            !warnings.iter().any(|w| w.contains("utils")),
+            "no unknown-identifier warning for utils or utils.helper: {warnings:?}"
+        );
+    }
+
+    // ── split_multisym ────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_multisym_dot() {
+        assert_eq!(split_multisym("utils.helper"), Some(("utils", "helper")));
+    }
+
+    #[test]
+    fn split_multisym_colon() {
+        assert_eq!(split_multisym("obj:method"), Some(("obj", "method")));
+    }
+
+    #[test]
+    fn split_multisym_no_separator() {
+        assert_eq!(split_multisym("plain"), None);
+    }
+
+    #[test]
+    fn split_multisym_nested_dot() {
+        assert_eq!(split_multisym("a.b.c"), Some(("a", "b.c")));
     }
 }

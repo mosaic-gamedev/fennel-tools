@@ -1,12 +1,23 @@
 /// File state management. Each open file is parsed and analyzed on every change.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use dashmap::DashMap;
 use tower_lsp::lsp_types::Url;
 
+use crate::analyzer::{AnalysisResult, DefinitionInfo};
 use crate::docs::{BuiltinSet, Platform};
 use crate::parser::{AstNode, ParseError};
-use crate::analyzer::AnalysisResult;
+
+/// Top-level exports from a required module file.
+#[derive(Debug)]
+pub struct ModuleExports {
+    pub uri: Url,
+    /// Source text of the module (needed for span→range conversion in goto_definition).
+    pub text: String,
+    /// Top-level definitions, keyed by name.
+    pub defs: HashMap<String, DefinitionInfo>,
+}
 
 #[derive(Debug)]
 pub struct AnalyzedFile {
@@ -18,6 +29,9 @@ pub struct AnalyzedFile {
     pub ast: Vec<AstNode>,
     pub parse_errors: Vec<ParseError>,
     pub analysis: AnalysisResult,
+    /// Resolved require bindings: local binding name → module exports.
+    /// Populated from `(local name (require :mod))` forms when workspace root is set.
+    pub modules: HashMap<String, Arc<ModuleExports>>,
 }
 
 #[derive(Clone)]
@@ -25,6 +39,9 @@ pub struct Workspace {
     files: Arc<DashMap<String, AnalyzedFile>>,
     // OnceLock so configure_platform() can be called from &self in initialize().
     builtins: Arc<OnceLock<Arc<BuiltinSet>>>,
+    /// Cache of analyzed module files (required but not open).
+    /// Keyed by absolute filesystem path; bounded by number of unique source files.
+    require_cache: Arc<DashMap<std::path::PathBuf, Arc<ModuleExports>>>,
 }
 
 impl Default for Workspace {
@@ -32,6 +49,7 @@ impl Default for Workspace {
         Self {
             files: Arc::default(),
             builtins: Arc::new(OnceLock::new()),
+            require_cache: Arc::default(),
         }
     }
 }
@@ -64,9 +82,37 @@ impl Workspace {
             .as_ref()
     }
 
-    pub fn update(&self, uri: Url, text: String, version: i32) {
+    /// Parse, analyze, and optionally resolve require bindings for a file.
+    ///
+    /// `workspace_root` is used to resolve `(require :mod)` to `.fnl` paths.
+    /// Pass `None` (e.g. in tests) to skip cross-file resolution.
+    pub fn update(
+        &self,
+        uri: Url,
+        text: String,
+        version: i32,
+        workspace_root: Option<&std::path::Path>,
+    ) {
+        // Invalidate the require_cache entry for this file so callers get
+        // fresh exports after edits.
+        if let Ok(path) = uri.to_file_path() {
+            self.require_cache.remove(&path);
+        }
+
         let (ast, parse_errors) = crate::parser::Parser::parse(&text);
         let analysis = crate::analyzer::analyze(&ast);
+
+        // Resolve require bindings → module exports
+        let mut modules: HashMap<String, Arc<ModuleExports>> = HashMap::new();
+        if let Some(root) = workspace_root {
+            for (binding, module_name) in &analysis.module_bindings {
+                if let Some(path) = resolve_require_path(module_name, root) {
+                    if let Some(exports) = self.load_module(&path) {
+                        modules.insert(binding.clone(), exports);
+                    }
+                }
+            }
+        }
 
         self.files.insert(
             uri.to_string(),
@@ -77,6 +123,7 @@ impl Workspace {
                 ast,
                 parse_errors,
                 analysis,
+                modules,
             },
         );
     }
@@ -93,6 +140,72 @@ impl Workspace {
         let entry = self.files.get(&uri.to_string())?;
         Some(f(&*entry))
     }
+
+    /// Load and cache the top-level exports of a module file.
+    ///
+    /// Priority: open files (live version) > require_cache > disk.
+    /// Reading from disk without a workspace root is intentional — callers
+    /// supply the resolved absolute path.
+    pub fn load_module(&self, path: &std::path::Path) -> Option<Arc<ModuleExports>> {
+        let uri = Url::from_file_path(path).ok()?;
+
+        // Open files take precedence: use the live in-memory version.
+        if let Some(f) = self.files.get(&uri.to_string()) {
+            return Some(Arc::new(ModuleExports {
+                uri: f.uri.clone(),
+                text: f.text.clone(),
+                defs: top_level_defs(&f.analysis),
+            }));
+        }
+
+        // Return cached analysis if available.
+        if let Some(cached) = self.require_cache.get(path) {
+            return Some(cached.clone());
+        }
+
+        // Read from disk, parse, analyze, cache.
+        let text = std::fs::read_to_string(path).ok()?;
+        let (ast, _) = crate::parser::Parser::parse(&text);
+        let analysis = crate::analyzer::analyze(&ast);
+
+        let exports = Arc::new(ModuleExports {
+            uri,
+            text,
+            defs: top_level_defs(&analysis),
+        });
+        self.require_cache.insert(path.to_path_buf(), exports.clone());
+        Some(exports)
+    }
+}
+
+/// Collect the names → DefinitionInfo for all bindings in the root scope (scope 0).
+fn top_level_defs(analysis: &AnalysisResult) -> HashMap<String, DefinitionInfo> {
+    let Some(root_scope) = analysis.scopes.first() else {
+        return HashMap::new();
+    };
+    root_scope
+        .bindings
+        .values()
+        .filter_map(|&def_byte| {
+            analysis.defs.get(&def_byte).cloned().map(|d| (d.name.clone(), d))
+        })
+        .collect()
+}
+
+/// Resolve a Fennel module name (e.g. `"my.util"`) to a `.fnl` file path
+/// relative to `root`. Tries `mod/name.fnl` then `mod/name/init.fnl`.
+pub fn resolve_require_path(
+    module: &str,
+    root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let rel = module.replace('.', "/");
+    for suffix in &[".fnl", "/init.fnl"] {
+        let candidate = root.join(format!("{rel}{suffix}"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -192,5 +305,113 @@ mod tests {
         // But shared builtins must still be there
         assert!(ws.builtins().is_known("print"));
         assert!(ws.builtins().is_known("unpack"));
+    }
+
+    // ── resolve_require_path ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_require_path_direct_fnl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "").unwrap();
+        let path = resolve_require_path("utils", dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("utils.fnl"));
+    }
+
+    #[test]
+    fn resolve_require_path_init_fnl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("utils")).unwrap();
+        std::fs::write(dir.path().join("utils/init.fnl"), "").unwrap();
+        let path = resolve_require_path("utils", dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("utils/init.fnl"));
+    }
+
+    #[test]
+    fn resolve_require_path_dotted_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("my")).unwrap();
+        std::fs::write(dir.path().join("my/mod.fnl"), "").unwrap();
+        let path = resolve_require_path("my.mod", dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("my/mod.fnl"));
+    }
+
+    #[test]
+    fn resolve_require_path_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_require_path("nonexistent", dir.path()).is_none());
+    }
+
+    // ── load_module ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_module_reads_top_level_defs() {
+        let dir = tempfile::tempdir().unwrap();
+        let fnl_path = dir.path().join("utils.fnl");
+        std::fs::write(&fnl_path, "(fn helper [x y] x)").unwrap();
+        let ws = Workspace::new();
+        let exports = ws.load_module(&fnl_path).unwrap();
+        assert!(exports.defs.contains_key("helper"), "helper should be a top-level def");
+        let helper = &exports.defs["helper"];
+        assert_eq!(helper.params, Some(vec!["x".to_string(), "y".to_string()]));
+    }
+
+    #[test]
+    fn load_module_caches_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let fnl_path = dir.path().join("mod.fnl");
+        std::fs::write(&fnl_path, "(local x 1)").unwrap();
+        let ws = Workspace::new();
+        let e1 = ws.load_module(&fnl_path).unwrap();
+        let e2 = ws.load_module(&fnl_path).unwrap();
+        assert!(Arc::ptr_eq(&e1, &e2), "second call should return cached Arc");
+    }
+
+    #[test]
+    fn update_resolves_require_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn greet [name] name)").unwrap();
+
+        let ws = Workspace::new();
+        let uri = Url::parse("file:///test.fnl").unwrap();
+        ws.update(
+            uri.clone(),
+            "(local utils (require :utils))\n(utils.greet \"world\")".to_string(),
+            1,
+            Some(dir.path()),
+        );
+
+        let has_module = ws.with_file(&uri, |f| f.modules.contains_key("utils"));
+        assert_eq!(has_module, Some(true));
+    }
+
+    #[test]
+    fn update_without_root_no_modules() {
+        let ws = Workspace::new();
+        let uri = Url::parse("file:///test.fnl").unwrap();
+        ws.update(
+            uri.clone(),
+            "(local x (require :utils))".to_string(),
+            1,
+            None,
+        );
+        let module_count = ws.with_file(&uri, |f| f.modules.len());
+        assert_eq!(module_count, Some(0));
+    }
+
+    #[test]
+    fn update_invalidates_require_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let fnl_path = dir.path().join("lib.fnl");
+        std::fs::write(&fnl_path, "(fn old [] nil)").unwrap();
+
+        let ws = Workspace::new();
+        // Populate cache
+        ws.load_module(&fnl_path).unwrap();
+        assert!(ws.require_cache.contains_key(&fnl_path));
+
+        // Update the file via the LSP — cache should be invalidated
+        let uri = Url::from_file_path(&fnl_path).unwrap();
+        ws.update(uri, "(fn new [] nil)".to_string(), 1, None);
+        assert!(!ws.require_cache.contains_key(&fnl_path), "cache should be cleared on update");
     }
 }
