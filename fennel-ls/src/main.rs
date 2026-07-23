@@ -1,6 +1,7 @@
 mod analyzer;
 mod config;
 mod docs;
+mod fmt;
 mod lexer;
 mod parser;
 mod server;
@@ -13,6 +14,10 @@ use tower_lsp::{LspService, Server};
 #[derive(Parser)]
 #[command(name = "fennel-ls", version, about = "Language server for Fennel")]
 struct Cli {
+    /// Disable textDocument/formatting support.
+    #[arg(long)]
+    no_formatting: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -31,17 +36,19 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    let formatting_enabled = !cli.no_formatting;
+
     match cli.command.unwrap_or(Command::Server) {
-        Command::Server => run_server().await,
+        Command::Server => run_server(formatting_enabled).await,
         Command::Check { files } => run_check(files),
     }
 }
 
-async fn run_server() {
+async fn run_server(formatting_enabled: bool) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(server::Backend::new);
+    let (service, socket) = LspService::new(move |client| server::Backend::new(client, formatting_enabled));
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 

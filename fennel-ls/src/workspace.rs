@@ -7,7 +7,18 @@ use tower_lsp::lsp_types::Url;
 
 use crate::analyzer::{AnalysisResult, DefinitionInfo};
 use crate::docs::{BuiltinSet, Platform};
+use crate::lexer::Span;
 use crate::parser::{AstNode, ParseError};
+
+/// A cross-file reference to a definition in another file.
+#[derive(Debug, Clone)]
+pub struct CrossFileRef {
+    pub uri: Url,
+    pub text: String,
+    pub span: Span,
+    /// Full multisym as it appears in the referencing file (e.g. `"utils.greet"`).
+    pub sym_name: String,
+}
 
 /// Top-level exports from a required module file.
 #[derive(Debug)]
@@ -139,6 +150,81 @@ impl Workspace {
     {
         let entry = self.files.get(&uri.to_string())?;
         Some(f(&*entry))
+    }
+
+    /// Search every open file and the require cache for definitions whose names
+    /// contain `query` (case-insensitive). An empty query returns everything.
+    /// Returns `(uri, file_text, def)` triples — callers convert spans to ranges.
+    pub fn all_defs(&self, query: &str) -> Vec<(Url, String, DefinitionInfo)> {
+        let q = query.to_lowercase();
+        let mut out = Vec::new();
+
+        for entry in self.files.iter() {
+            let f = entry.value();
+            for def in f.analysis.defs.values() {
+                if q.is_empty() || def.name.to_lowercase().contains(&q) {
+                    out.push((f.uri.clone(), f.text.clone(), def.clone()));
+                }
+            }
+        }
+
+        // Also search module files that are required but not currently open.
+        for entry in self.require_cache.iter() {
+            let exports = entry.value();
+            for def in exports.defs.values() {
+                if q.is_empty() || def.name.to_lowercase().contains(&q) {
+                    out.push((exports.uri.clone(), exports.text.clone(), def.clone()));
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Find every cross-file reference to the definition named `def_name`
+    /// in the file at `def_uri`, across all currently open files.
+    ///
+    /// A cross-file reference is a multisym like `utils.greet` in a file that
+    /// imports `def_uri` as the local binding `utils`.
+    pub fn cross_file_refs_of(&self, def_uri: &Url, def_name: &str) -> Vec<CrossFileRef> {
+        let def_path = def_uri.path();
+        let mut out = Vec::new();
+
+        for entry in self.files.iter() {
+            let file = entry.value();
+            if file.uri.path() == def_path {
+                continue; // same-file refs are handled by the caller
+            }
+            for (binding, exports) in &file.modules {
+                if exports.uri.path() != def_path {
+                    continue;
+                }
+                // This file imports def_uri under the local name `binding`.
+                for sym in &file.analysis.syms {
+                    if sym.is_def {
+                        continue;
+                    }
+                    if let Some(sep) = sym.name.find(['.', ':']) {
+                        let root = &sym.name[..sep];
+                        let member_full = &sym.name[sep + 1..];
+                        let member_root = member_full
+                            .split(['.', ':'])
+                            .next()
+                            .unwrap_or(member_full);
+                        if root == binding && member_root == def_name {
+                            out.push(CrossFileRef {
+                                uri: file.uri.clone(),
+                                text: file.text.clone(),
+                                span: sym.span.clone(),
+                                sym_name: sym.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        out
     }
 
     /// Load and cache the top-level exports of a module file.

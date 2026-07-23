@@ -35,6 +35,32 @@ pub enum Form {
 
 pub type AstNode = Spanned<Form>;
 
+/// Like `Form` but includes `Comment` nodes. Used by the formatter and any
+/// future tool that needs source-faithful AST traversal.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum RichForm {
+    Symbol(String),
+    Keyword(String),
+    Str(String),
+    Number(f64),
+    Bool(bool),
+    Nil,
+    Varargs,
+    List(Vec<RichNode>),
+    Table(Vec<RichNode>),
+    Sequence(Vec<RichNode>),
+    Quote(Box<RichNode>),
+    Quasiquote(Box<RichNode>),
+    Unquote(Box<RichNode>),
+    UnquoteSplice(Box<RichNode>),
+    HashFn(Box<RichNode>),
+    /// A line comment including its leading `;` characters.
+    Comment(String),
+}
+
+pub type RichNode = Spanned<RichForm>;
+
 /// Parse errors that don't halt parsing (recovery is best-effort).
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -58,10 +84,17 @@ impl Parser {
     }
 
     pub fn parse(src: &str) -> (Vec<AstNode>, Vec<ParseError>) {
-        let tokens = crate::lexer::Lexer::tokenize(src);
+        let (rich, errors) = Self::parse_with_comments(src);
+        (strip_comments(rich), errors)
+    }
+
+    /// Parse `src` into a comment-bearing AST. Consumers that need source-
+    /// faithful traversal (e.g. the formatter) should use this entry point.
+    pub fn parse_with_comments(src: &str) -> (Vec<RichNode>, Vec<ParseError>) {
+        let tokens = crate::lexer::Lexer::tokenize_with_comments(src);
         let mut parser = Self::new(tokens);
-        let forms = parser.parse_all();
-        (forms, parser.errors)
+        let rich = parser.parse_all_rich();
+        (rich, parser.errors)
     }
 
     fn peek(&self) -> Option<&SpannedToken> {
@@ -171,6 +204,9 @@ impl Parser {
                 });
                 return None;
             }
+            // Comments are only emitted by tokenize_with_comments; parse_form
+            // is only called from parse_all which uses the plain tokenizer.
+            Token::Comment(_) => unreachable!("comment token in non-comment parse path"),
         };
 
         Some(Spanned { node: form, span })
@@ -208,6 +244,143 @@ impl Parser {
             }
         }
     }
+
+    fn parse_all_rich(&mut self) -> Vec<RichNode> {
+        let mut forms = Vec::new();
+        while self.peek().is_some() {
+            match self.parse_form_rich() {
+                Some(f) => forms.push(f),
+                None => {
+                    let span = self.peek().map(|t| t.span.clone());
+                    self.advance();
+                    if let Some(s) = span {
+                        self.errors.push(ParseError {
+                            message: "unexpected closing delimiter".into(),
+                            span: s,
+                        });
+                    }
+                }
+            }
+        }
+        forms
+    }
+
+    fn parse_form_rich(&mut self) -> Option<RichNode> {
+        let tok = self.advance()?;
+        let span = tok.span.clone();
+
+        let form = match &tok.token {
+            Token::Comment(text) => RichForm::Comment(text.clone()),
+            Token::LParen => {
+                let (forms, end_span) = self.parse_until_rich(Token::RParen, &span)?;
+                return Some(Spanned { node: RichForm::List(forms), span: Span::merge(&span, &end_span) });
+            }
+            Token::LBrace => {
+                let (forms, end_span) = self.parse_until_rich(Token::RBrace, &span)?;
+                return Some(Spanned { node: RichForm::Table(forms), span: Span::merge(&span, &end_span) });
+            }
+            Token::LBracket => {
+                let (forms, end_span) = self.parse_until_rich(Token::RBracket, &span)?;
+                return Some(Spanned { node: RichForm::Sequence(forms), span: Span::merge(&span, &end_span) });
+            }
+            Token::Quote => {
+                let inner = self.parse_form_rich()?;
+                let merged = Span::merge(&span, &inner.span);
+                return Some(Spanned { node: RichForm::Quote(Box::new(inner)), span: merged });
+            }
+            Token::Quasiquote => {
+                let inner = self.parse_form_rich()?;
+                let merged = Span::merge(&span, &inner.span);
+                return Some(Spanned { node: RichForm::Quasiquote(Box::new(inner)), span: merged });
+            }
+            Token::Unquote => {
+                let inner = self.parse_form_rich()?;
+                let merged = Span::merge(&span, &inner.span);
+                return Some(Spanned { node: RichForm::Unquote(Box::new(inner)), span: merged });
+            }
+            Token::UnquoteSplice => {
+                let inner = self.parse_form_rich()?;
+                let merged = Span::merge(&span, &inner.span);
+                return Some(Spanned { node: RichForm::UnquoteSplice(Box::new(inner)), span: merged });
+            }
+            Token::HashFn => {
+                let inner = self.parse_form_rich()?;
+                let merged = Span::merge(&span, &inner.span);
+                return Some(Spanned { node: RichForm::HashFn(Box::new(inner)), span: merged });
+            }
+            Token::Symbol(s) => RichForm::Symbol(s.clone()),
+            Token::Keyword(s) => RichForm::Keyword(s.clone()),
+            Token::Str(s) => RichForm::Str(s.clone()),
+            Token::Number(n) => RichForm::Number(*n),
+            Token::Bool(b) => RichForm::Bool(*b),
+            Token::Nil => RichForm::Nil,
+            Token::Varargs => RichForm::Varargs,
+            Token::RParen | Token::RBrace | Token::RBracket => {
+                self.errors.push(ParseError {
+                    message: "unexpected closing delimiter".into(),
+                    span: span.clone(),
+                });
+                return None;
+            }
+        };
+        Some(Spanned { node: form, span })
+    }
+
+    fn parse_until_rich(&mut self, close: Token, open_span: &Span) -> Option<(Vec<RichNode>, Span)> {
+        let mut forms = Vec::new();
+        loop {
+            match self.peek() {
+                None => {
+                    self.errors.push(ParseError {
+                        message: "unclosed delimiter".into(),
+                        span: open_span.clone(),
+                    });
+                    let fake_end = self.tokens.last()
+                        .map(|t| t.span.clone())
+                        .unwrap_or_else(|| open_span.clone());
+                    return Some((forms, fake_end));
+                }
+                Some(t) if t.token == close => {
+                    let end_span = t.span.clone();
+                    self.advance();
+                    return Some((forms, end_span));
+                }
+                _ => {
+                    if let Some(f) = self.parse_form_rich() {
+                        forms.push(f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Strip `RichForm::Comment` nodes, converting a rich AST to a plain one.
+fn strip_comments(nodes: Vec<RichNode>) -> Vec<AstNode> {
+    nodes.into_iter().filter_map(rich_to_ast).collect()
+}
+
+fn rich_to_ast(node: RichNode) -> Option<AstNode> {
+    let span = node.span;
+    let form = match node.node {
+        RichForm::Comment(_) => return None,
+        RichForm::Symbol(s) => Form::Symbol(s),
+        RichForm::Keyword(s) => Form::Keyword(s),
+        RichForm::Str(s) => Form::Str(s),
+        RichForm::Number(n) => Form::Number(n),
+        RichForm::Bool(b) => Form::Bool(b),
+        RichForm::Nil => Form::Nil,
+        RichForm::Varargs => Form::Varargs,
+        RichForm::List(ch) => Form::List(strip_comments(ch)),
+        RichForm::Table(ch) => Form::Table(strip_comments(ch)),
+        RichForm::Sequence(ch) => Form::Sequence(strip_comments(ch)),
+        RichForm::Quote(inner) => Form::Quote(Box::new(rich_to_ast(*inner)?)),
+        RichForm::Quasiquote(inner) => Form::Quasiquote(Box::new(rich_to_ast(*inner)?)),
+        RichForm::Unquote(inner) => Form::Unquote(Box::new(rich_to_ast(*inner)?)),
+        RichForm::UnquoteSplice(inner) => Form::UnquoteSplice(Box::new(rich_to_ast(*inner)?)),
+        RichForm::HashFn(inner) => Form::HashFn(Box::new(rich_to_ast(*inner)?)),
+    };
+    Some(Spanned { node: form, span })
 }
 
 /// Walk the AST and call `f` for each node (depth-first, pre-order).

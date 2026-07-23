@@ -45,8 +45,11 @@ Jumps to the binding site of the symbol under the cursor.
 
 ### Find references
 Returns all use-sites of whichever definition the cursor is on (or the
-definition a reference points to). Single-file only. Includes the definition
-itself.
+definition a reference points to). Includes the definition itself.
+- **Same-file:** all references in the current file.
+- **Cross-file:** if the cursor is on a top-level definition (or a multisym
+  reference to one), also returns every `binding.def_name` site in all open
+  files that import the definition's file.
 
 ### Document highlight
 Same logic as find-references. Returns `WRITE` highlight kind for the
@@ -56,8 +59,18 @@ definition and `READ` for uses.
 Lists every definition in the file (`local`, `var`, `global`, `fn`, `macro`,
 `param`, `loop-var`, destructured). Maps `DefKind` to LSP `SymbolKind`.
 
+### Workspace symbols (`workspace/symbol`)
+Searches all open files and the require-cache for definitions matching a query
+string (case-insensitive substring match). Returns the definition's name, kind,
+and location in its source file. Powered by `all_defs()` in `workspace.rs`.
+
 ### Rename
-Renames all occurrences of a symbol within the current file. Single-file only.
+Renames all occurrences of a symbol.
+- **Same-file:** all occurrences of the binding in the current file.
+- **Cross-file:** if renaming a top-level definition (or a multisym that
+  resolves to one), also rewrites every `binding.old_name` to
+  `binding.new_name` across all open files that import the definition's file,
+  preserving the `.` or `:` separator.
 
 
 ### Semantic tokens (`textDocument/semanticTokens/full`)
@@ -115,30 +128,33 @@ argument maps to (e.g. `a:` before the first argument). Suppressed for
 
 ---
 
-## Should be implemented
-
-### Workspace symbols (`workspace/symbol`)
-Search all open (or project-wide) files for definitions matching a query
-string. Straightforward extension of the per-file document-symbol handler;
-cross-file require resolution means the dependency graph already exists.
-
 ### Formatting (`textDocument/formatting`)
-A pretty-printer that walks `Vec<AstNode>` and emits canonically indented
-Fennel. Implementation in a new `src/fmt.rs`. The lexer already records
-line/col for every token; comment tokens can be interleaved with AST nodes to
-preserve them.
+Pretty-printer, enabled by default. Disable by passing `--no-formatting` when
+starting the server (e.g. `fennel-ls --no-formatting`).
+
+When enabled:
+- Short forms (≤ 80 characters flat) are kept on one line.
+- **Body forms** (`fn`, `let`, `if`, `when`, `match`, `each`, `for`, etc.) pack
+  atom/sequence arguments onto the head line; the first compound (`List`/`Table`)
+  child breaks to a new indented line (2-space indent, same as Clojure convention).
+- **Regular calls** pack arguments greedily until the column limit is exceeded,
+  then break.
+- **Comments** are preserved in-place and always placed on their own line.
+- Blank line between each pair of top-level forms; no blank line between a
+  leading comment and the form it annotates.
+- Single trailing newline.
+- Returns no edits (no-op) if the source has parse errors, so broken files are
+  never mangled.
+- Atoms are emitted verbatim from the source text (preserves `0xff`, string
+  escapes, and other exact spellings).
+
+## Should be implemented
 
 ### Macro expansion at call sites
 Macros introduce names into the caller's scope that the static analyzer
 cannot see. The right long-term fix is to spawn `fennel --expand` on a call
 site and parse the result. A feature flag can gate this on the presence of
 Fennel on `PATH`.
-
-### Cross-file references and rename
-Find-references and rename currently operate within the current file only.
-Extending them cross-file requires scanning all files that transitively
-require the file containing the renamed definition — the require_cache already
-has the per-file module graph needed to compute this set.
 
 ---
 

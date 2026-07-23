@@ -53,6 +53,8 @@ pub enum Token {
     Varargs,
     // Symbols / identifiers (may be multisym like a.b.c or a:method)
     Symbol(String),
+    // Comments (only emitted by tokenize_with_comments; text includes the leading `;`)
+    Comment(String),
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +68,7 @@ pub struct Lexer<'src> {
     pos: usize,
     line: u32,
     col: u32,
+    with_comments: bool,
 }
 
 impl<'src> Lexer<'src> {
@@ -75,11 +78,23 @@ impl<'src> Lexer<'src> {
             pos: 0,
             line: 0,
             col: 0,
+            with_comments: false,
         }
     }
 
     pub fn tokenize(src: &'src str) -> Vec<SpannedToken> {
         let mut lex = Self::new(src);
+        let mut out = Vec::new();
+        while let Some(tok) = lex.next_token() {
+            out.push(tok);
+        }
+        out
+    }
+
+    /// Like `tokenize` but also emits `Token::Comment` for line comments.
+    pub fn tokenize_with_comments(src: &'src str) -> Vec<SpannedToken> {
+        let mut lex = Self::new(src);
+        lex.with_comments = true;
         let mut out = Vec::new();
         while let Some(tok) = lex.next_token() {
             out.push(tok);
@@ -107,18 +122,21 @@ impl<'src> Lexer<'src> {
         Some(c)
     }
 
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')) {
+            self.advance();
+        }
+    }
+
     fn skip_whitespace_and_comments(&mut self) {
         loop {
+            self.skip_whitespace();
             match self.peek() {
-                Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => {
-                    self.advance();
-                }
                 Some(b';') => {
                     while self.peek().map_or(false, |c| c != b'\n') {
                         self.advance();
                     }
                 }
-                // Shebang line
                 Some(b'#') if self.pos == 0 && self.peek2() == Some(b'!') => {
                     while self.peek().map_or(false, |c| c != b'\n') {
                         self.advance();
@@ -142,7 +160,29 @@ impl<'src> Lexer<'src> {
 
     fn next_token(&mut self) -> Option<SpannedToken> {
         loop {
-            self.skip_whitespace_and_comments();
+            if self.with_comments {
+                self.skip_whitespace();
+                let is_comment = self.peek() == Some(b';');
+                let is_shebang = self.pos == 0
+                    && self.peek() == Some(b'#')
+                    && self.peek2() == Some(b'!');
+                if is_comment || is_shebang {
+                    let start = self.pos;
+                    let sl = self.line;
+                    let sc = self.col;
+                    while self.peek().map_or(false, |c| c != b'\n') {
+                        self.advance();
+                    }
+                    let text = String::from_utf8_lossy(&self.src[start..self.pos])
+                        .into_owned();
+                    return Some(SpannedToken {
+                        token: Token::Comment(text),
+                        span: self.span_from(start, sl, sc),
+                    });
+                }
+            } else {
+                self.skip_whitespace_and_comments();
+            }
 
             let start = self.pos;
             let sl = self.line;

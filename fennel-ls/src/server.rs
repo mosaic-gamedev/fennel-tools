@@ -26,16 +26,19 @@ pub struct Backend {
     /// Per-symbol hover docs loaded from `global_docs` (inline or via `include`).
     /// Keys are exact Fennel symbol names, e.g. `"MyLib.module.fn"`.
     global_docs: OnceLock<HashMap<String, GlobalDoc>>,
+    /// Whether `textDocument/formatting` is enabled (disabled via `--no-formatting`).
+    formatting_enabled: bool,
 }
 
 impl Backend {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, formatting_enabled: bool) -> Self {
         Self {
             client,
             workspace: Workspace::new(),
             workspace_root: OnceLock::new(),
             extra_globals: OnceLock::new(),
             global_docs: OnceLock::new(),
+            formatting_enabled,
         }
     }
 
@@ -140,7 +143,6 @@ impl LanguageServer for Backend {
             if let Some(docs) = config.global_docs {
                 let _ = self.global_docs.set(docs);
             }
-
             let _ = self.workspace_root.set(path);
         }
 
@@ -157,6 +159,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
@@ -175,6 +178,11 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: if self.formatting_enabled {
+                    Some(OneOf::Left(true))
+                } else {
+                    None
+                },
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -419,40 +427,79 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
 
+        // Collect same-file refs AND derive the cross-file key in one pass.
         let result = self.workspace.with_file(uri, |file| {
             let byte = text::position_to_byte(&file.text, pos)? as u32;
             let sym = file.analysis.symbol_at(byte)?;
 
-            // Find the definition byte (either this is a def, or follow the ref)
-            let target_def = if sym.is_def {
-                sym.span.start
+            // For cross-file multisyms (e.g. `utils.greet`), def_byte is None
+            // because the symbol isn't defined locally.  Don't bail out early —
+            // just skip the same-file search for those.
+            let target_def: Option<u32> = if sym.is_def {
+                Some(sym.span.start)
             } else {
-                sym.def_byte?
+                sym.def_byte
             };
 
-            let mut locs: Vec<Location> = file
-                .analysis
-                .syms
-                .iter()
-                .filter(|s| {
-                    (s.is_def && s.span.start == target_def)
-                        || (!s.is_def && s.def_byte == Some(target_def))
-                })
-                .map(|s| Location {
-                    uri: file.uri.clone(),
-                    range: text::span_to_range(&file.text, &s.span),
-                })
-                .collect();
+            let same_file: Vec<Location> = match target_def {
+                Some(def_start) => file
+                    .analysis
+                    .syms
+                    .iter()
+                    .filter(|s| {
+                        (s.is_def && s.span.start == def_start)
+                            || (!s.is_def && s.def_byte == Some(def_start))
+                    })
+                    .map(|s| Location {
+                        uri: file.uri.clone(),
+                        range: text::span_to_range(&file.text, &s.span),
+                    })
+                    .collect(),
+                None => vec![],
+            };
 
-            if params.context.include_declaration {
-                // Already included above
+            // Determine (def_uri, def_name) for cross-file lookup.
+            // If the cursor is on a def, the def is in this file.
+            // If the cursor is on a cross-file ref (e.g. `utils.greet`), resolve
+            // through file.modules to the exporting file.
+            let cross_key: Option<(Url, String)> = if sym.is_def {
+                Some((file.uri.clone(), sym.name.clone()))
+            } else if let Some(sep) = sym.name.find(['.', ':']) {
+                let root = &sym.name[..sep];
+                let member = &sym.name[sep + 1..];
+                let member_root = member.split(['.', ':']).next().unwrap_or(member);
+                file.modules
+                    .get(root)
+                    .map(|ex| (ex.uri.clone(), member_root.to_string()))
+            } else {
+                None
+            };
+
+            if same_file.is_empty() && cross_key.is_none() {
+                return None;
             }
-
-            locs.sort_by_key(|l| (l.range.start.line, l.range.start.character));
-            Some(locs)
+            Some((same_file, cross_key))
         });
 
-        Ok(result.flatten())
+        let (mut locs, cross_key) = match result.flatten() {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Append cross-file refs from all open files.
+        if let Some((def_uri, def_name)) = cross_key {
+            for xref in self.workspace.cross_file_refs_of(&def_uri, &def_name) {
+                locs.push(Location {
+                    uri: xref.uri,
+                    range: text::span_to_range(&xref.text, &xref.span),
+                });
+            }
+        }
+
+        locs.sort_by_key(|l| {
+            (l.uri.to_string(), l.range.start.line, l.range.start.character)
+        });
+        Ok(if locs.is_empty() { None } else { Some(locs) })
     }
 
     // ── Document highlight ─────────────────────────────────────────────────────
@@ -531,6 +578,36 @@ impl LanguageServer for Backend {
         });
 
         Ok(result)
+    }
+
+    // ── Workspace symbols ─────────────────────────────────────────────────────
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let defs = self.workspace.all_defs(&params.query);
+        if defs.is_empty() {
+            return Ok(None);
+        }
+        let syms = defs
+            .into_iter()
+            .map(|(uri, file_text, def)| {
+                #[allow(deprecated)]
+                SymbolInformation {
+                    name: def.name.clone(),
+                    kind: def_kind_to_symbol_kind(&def.kind),
+                    tags: None,
+                    deprecated: None,
+                    location: Location {
+                        uri,
+                        range: text::span_to_range(&file_text, &def.span),
+                    },
+                    container_name: None,
+                }
+            })
+            .collect();
+        Ok(Some(syms))
     }
 
     // ── Completion ────────────────────────────────────────────────────────────
@@ -668,36 +745,77 @@ impl LanguageServer for Backend {
             let byte = text::position_to_byte(&file.text, pos)? as u32;
             let sym = file.analysis.symbol_at(byte)?;
 
-            let target_def = if sym.is_def {
-                sym.span.start
+            let target_def: Option<u32> = if sym.is_def {
+                Some(sym.span.start)
             } else {
-                sym.def_byte?
+                sym.def_byte
             };
 
-            let edits: Vec<TextEdit> = file
-                .analysis
-                .syms
-                .iter()
-                .filter(|s| {
-                    (s.is_def && s.span.start == target_def)
-                        || (!s.is_def && s.def_byte == Some(target_def))
-                })
-                .map(|s| TextEdit {
-                    range: text::span_to_range(&file.text, &s.span),
-                    new_text: new_name.clone(),
-                })
-                .collect();
+            let same_file_edits: Vec<TextEdit> = match target_def {
+                Some(def_start) => file
+                    .analysis
+                    .syms
+                    .iter()
+                    .filter(|s| {
+                        (s.is_def && s.span.start == def_start)
+                            || (!s.is_def && s.def_byte == Some(def_start))
+                    })
+                    .map(|s| TextEdit {
+                        range: text::span_to_range(&file.text, &s.span),
+                        new_text: new_name.clone(),
+                    })
+                    .collect(),
+                None => vec![],
+            };
 
-            let mut changes = HashMap::new();
-            changes.insert(file.uri.clone(), edits);
+            // Same cross-file key logic as references().
+            let cross_key: Option<(Url, String)> = if sym.is_def {
+                Some((file.uri.clone(), sym.name.clone()))
+            } else if let Some(sep) = sym.name.find(['.', ':']) {
+                let root = &sym.name[..sep];
+                let member = &sym.name[sep + 1..];
+                let member_root = member.split(['.', ':']).next().unwrap_or(member);
+                file.modules
+                    .get(root)
+                    .map(|ex| (ex.uri.clone(), member_root.to_string()))
+            } else {
+                None
+            };
 
-            Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            })
+            Some((file.uri.clone(), same_file_edits, cross_key))
         });
 
-        Ok(result.flatten())
+        let (file_uri, same_file_edits, cross_key) = match result.flatten() {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        changes.insert(file_uri, same_file_edits);
+
+        // Cross-file: for each ref `binding_prefix.old_name`, rename the member.
+        if let Some((def_uri, def_name)) = cross_key {
+            for xref in self.workspace.cross_file_refs_of(&def_uri, &def_name) {
+                // xref.sym_name is like "utils.greet" — preserve the prefix+sep.
+                let new_sym = if let Some(sep_idx) = xref.sym_name.find(['.', ':']) {
+                    let sep_char = &xref.sym_name[sep_idx..=sep_idx];
+                    let prefix = &xref.sym_name[..sep_idx];
+                    format!("{}{}{}", prefix, sep_char, new_name)
+                } else {
+                    new_name.clone()
+                };
+                let edit = TextEdit {
+                    range: text::span_to_range(&xref.text, &xref.span),
+                    new_text: new_sym,
+                };
+                changes.entry(xref.uri).or_default().push(edit);
+            }
+        }
+
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }))
     }
 
     // ── Code actions ──────────────────────────────────────────────────────────
@@ -855,6 +973,33 @@ impl LanguageServer for Backend {
             })
         });
         Ok(result)
+    }
+
+    // ── Formatting ────────────────────────────────────────────────────────────
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        if !self.formatting_enabled {
+            return Ok(None);
+        }
+        let uri = &params.text_document.uri;
+        let edits = self.workspace.with_file(uri, |file| {
+            let formatted = crate::fmt::format(&file.text)?;
+            if formatted == file.text {
+                return Some(vec![]);
+            }
+            let end = text::byte_to_position(&file.text, file.text.len());
+            Some(vec![TextEdit {
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end,
+                },
+                new_text: formatted,
+            }])
+        });
+        Ok(edits.flatten())
     }
 }
 
@@ -1997,6 +2142,121 @@ mod tests {
             !warnings.iter().any(|w| w.contains("utils")),
             "no unknown-identifier warning for utils or utils.helper: {warnings:?}"
         );
+    }
+
+    // ── workspace/symbol (all_defs) ───────────────────────────────────────────
+
+    #[test]
+    fn workspace_symbol_finds_def_in_open_file() {
+        let ws = Workspace::new();
+        let uri = Url::parse("file:///main.fnl").unwrap();
+        ws.update(uri, "(fn greet [x] x) (local msg \"hi\")".to_string(), 1, None);
+        let defs = ws.all_defs("gre");
+        assert!(defs.iter().any(|(_, _, d)| d.name == "greet"), "greet not found: {defs:?}");
+    }
+
+    #[test]
+    fn workspace_symbol_empty_query_returns_all() {
+        let ws = Workspace::new();
+        let uri = Url::parse("file:///main.fnl").unwrap();
+        ws.update(uri, "(fn alpha []) (fn beta [])".to_string(), 1, None);
+        let defs = ws.all_defs("");
+        let names: Vec<_> = defs.iter().map(|(_, _, d)| d.name.as_str()).collect();
+        assert!(names.contains(&"alpha") && names.contains(&"beta"), "{names:?}");
+    }
+
+    #[test]
+    fn workspace_symbol_case_insensitive() {
+        let ws = Workspace::new();
+        let uri = Url::parse("file:///main.fnl").unwrap();
+        ws.update(uri, "(fn Greet [x] x)".to_string(), 1, None);
+        let defs = ws.all_defs("greet");
+        assert!(defs.iter().any(|(_, _, d)| d.name == "Greet"), "case-insensitive miss: {defs:?}");
+    }
+
+    #[test]
+    fn workspace_symbol_searches_require_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn helper [] nil)").unwrap();
+        let (ws, _) = ws_with_require(dir.path(), "(local utils (require :utils))");
+        let defs = ws.all_defs("helper");
+        assert!(defs.iter().any(|(_, _, d)| d.name == "helper"), "module def not found: {defs:?}");
+    }
+
+    // ── cross-file references ─────────────────────────────────────────────────
+
+    #[test]
+    fn cross_file_refs_finds_uses_in_consumer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn greet [] nil)").unwrap();
+        let consumer = "(local utils (require :utils))\n(utils.greet)\n(utils.greet)";
+        let (ws, _) = ws_with_require(dir.path(), consumer);
+        let def_uri = Url::from_file_path(dir.path().join("utils.fnl")).unwrap();
+        let refs = ws.cross_file_refs_of(&def_uri, "greet");
+        assert_eq!(refs.len(), 2, "expected 2 cross-file refs: {refs:?}");
+    }
+
+    #[test]
+    fn cross_file_refs_sym_name_is_qualified() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn greet [] nil)").unwrap();
+        let consumer = "(local utils (require :utils))\n(utils.greet)";
+        let (ws, _) = ws_with_require(dir.path(), consumer);
+        let def_uri = Url::from_file_path(dir.path().join("utils.fnl")).unwrap();
+        let refs = ws.cross_file_refs_of(&def_uri, "greet");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].sym_name, "utils.greet");
+    }
+
+    #[test]
+    fn cross_file_refs_no_match_for_other_member() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn greet [] nil) (fn bye [] nil)").unwrap();
+        let consumer = "(local utils (require :utils))\n(utils.greet)";
+        let (ws, _) = ws_with_require(dir.path(), consumer);
+        let def_uri = Url::from_file_path(dir.path().join("utils.fnl")).unwrap();
+        let refs = ws.cross_file_refs_of(&def_uri, "bye");
+        assert!(refs.is_empty(), "bye is not called in consumer: {refs:?}");
+    }
+
+    // ── cross-file rename ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cross_file_rename_generates_qualified_new_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.fnl"), "(fn greet [] nil)").unwrap();
+        let consumer = "(local utils (require :utils))\n(utils.greet)";
+        let (ws, _) = ws_with_require(dir.path(), consumer);
+        let def_uri = Url::from_file_path(dir.path().join("utils.fnl")).unwrap();
+        let refs = ws.cross_file_refs_of(&def_uri, "greet");
+        assert_eq!(refs.len(), 1);
+        // Simulate rename edit: prefix + sep + new_name
+        let new_name = "hello";
+        let new_sym = {
+            let sym = &refs[0].sym_name;
+            let sep_idx = sym.find(['.', ':']).unwrap();
+            let sep_char = &sym[sep_idx..=sep_idx];
+            let prefix = &sym[..sep_idx];
+            format!("{}{}{}", prefix, sep_char, new_name)
+        };
+        assert_eq!(new_sym, "utils.hello");
+    }
+
+    #[test]
+    fn cross_file_rename_preserves_colon_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("obj.fnl"), "(fn method [] nil)").unwrap();
+        // Use colon syntax for method call
+        let consumer = "(local obj (require :obj))\n(obj:method)";
+        let (ws, _) = ws_with_require(dir.path(), consumer);
+        let def_uri = Url::from_file_path(dir.path().join("obj.fnl")).unwrap();
+        let refs = ws.cross_file_refs_of(&def_uri, "method");
+        assert_eq!(refs.len(), 1, "should find the method ref: {refs:?}");
+        let sym = &refs[0].sym_name;
+        let sep_idx = sym.find(['.', ':']).unwrap();
+        assert_eq!(&sym[sep_idx..=sep_idx], ":", "separator should be :");
+        let new_sym = format!("{}:{}", &sym[..sep_idx], "newMethod");
+        assert_eq!(new_sym, "obj:newMethod");
     }
 
     // ── split_multisym ────────────────────────────────────────────────────────
