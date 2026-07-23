@@ -1,6 +1,6 @@
 /// File state management. Each open file is parsed and analyzed on every change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use dashmap::DashMap;
 use tower_lsp::lsp_types::Url;
@@ -43,6 +43,9 @@ pub struct AnalyzedFile {
     /// Resolved require bindings: local binding name → module exports.
     /// Populated from `(local name (require :mod))` forms when workspace root is set.
     pub modules: HashMap<String, Arc<ModuleExports>>,
+    /// Names introduced by macro expansion (e.g. via `import-macros`).
+    /// Populated asynchronously after the initial analysis pass.
+    pub macro_globals: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -135,12 +138,26 @@ impl Workspace {
                 parse_errors,
                 analysis,
                 modules,
+                macro_globals: HashSet::new(),
             },
         );
     }
 
     pub fn remove(&self, uri: &Url) {
         self.files.remove(&uri.to_string());
+    }
+
+    /// Remove a file from the require cache so the next require of it re-reads disk.
+    pub fn invalidate_require_cache(&self, path: &std::path::Path) {
+        self.require_cache.remove(path);
+    }
+
+    /// Merge macro-expansion results into the file's scope.
+    /// Called asynchronously after initial analysis; triggers a diagnostic re-publish.
+    pub fn set_macro_globals(&self, uri: &Url, names: HashSet<String>) {
+        if let Some(mut entry) = self.files.get_mut(&uri.to_string()) {
+            entry.macro_globals = names;
+        }
     }
 
     /// Run `f` with a reference to the file, returning `None` if not found.
@@ -150,6 +167,11 @@ impl Workspace {
     {
         let entry = self.files.get(&uri.to_string())?;
         Some(f(&*entry))
+    }
+
+    /// Returns the URIs of all currently open (tracked) files.
+    pub fn all_open_uris(&self) -> Vec<Url> {
+        self.files.iter().map(|e| e.value().uri.clone()).collect()
     }
 
     /// Search every open file and the require cache for definitions whose names

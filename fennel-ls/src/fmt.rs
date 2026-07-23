@@ -428,4 +428,109 @@ mod tests {
         let twice = fmt(&once);
         assert_eq!(once, twice, "formatter is not idempotent");
     }
+
+    // ── String literals with embedded newlines ───────────────────────────────
+
+    #[test]
+    fn fmt_string_with_escape_newline_preserved() {
+        // "\n" escape sequence: the source bytes are '\' and 'n', not a real newline.
+        // The formatter must emit the escape verbatim; the result must be idempotent.
+        let src = "(print \"hello\\nworld\")\n";
+        let out = fmt(src);
+        assert!(out.contains("\"hello\\nworld\""), "escape \\n must be preserved: {out:?}");
+        assert_eq!(fmt(&out), out, "must be idempotent with \\n escape");
+    }
+
+    #[test]
+    fn fmt_string_with_literal_newline_preserved() {
+        // A string atom containing a LITERAL newline byte (line continuation in source).
+        // The formatter must not corrupt the content.
+        // Note: the Fennel lexer treats \<newline> as a line continuation inside strings,
+        // but atom_text emits the raw source bytes verbatim. We simulate what the formatter
+        // would receive when atom_text returns a string containing a literal '\n'.
+        let src = "(print \"hello\nworld\")";
+        let out = format(src);
+        // If the source is parseable, output must contain the original string content.
+        if let Some(out) = out {
+            assert!(out.contains("hello\nworld"),
+                "literal newline inside string must be preserved: {out:?}");
+            // Must be idempotent.
+            let again = fmt(&out);
+            assert_eq!(out, again, "must be idempotent with literal newline in string");
+        }
+        // If parse fails (which is also acceptable — bare newlines in strings are unusual),
+        // format() returning None is also correct behaviour.
+    }
+
+    #[test]
+    fn fmt_col_limit_check_does_not_count_trailing_newline_in_string() {
+        // A long string with a literal newline: the byte count exceeds the visual line width.
+        // The formatter may render this flat (preserving the literal newline), but must not
+        // produce output where the trailing-newline normalisation trims string content.
+        // Specifically: the `while out.ends_with("\n\n") { out.pop() }` must not eat into
+        // string literal content.
+        let src = "(local msg \"first line\nsecond line\")";
+        if let Some(out) = format(src) {
+            // The compound ends with `)`, so out.ends_with("\n\n") is false regardless.
+            assert!(!out.ends_with("\n\n"),
+                "output must not end with double newline: {out:?}");
+            assert!(out.ends_with('\n'),
+                "output must end with exactly one newline: {out:?}");
+            // Content must be preserved.
+            assert!(out.contains("first line\nsecond line"),
+                "string content must survive formatting: {out:?}");
+        }
+    }
+
+    // ── Comment / blank-line interaction ─────────────────────────────────────
+
+    #[test]
+    fn consecutive_comments_no_blank_line() {
+        // Two comments in a row: the second comment directly annotates the first,
+        // so no blank line should be inserted between them.
+        let src = ";; first line\n;; second line\n(fn foo [] nil)\n";
+        let out = fmt(src);
+        assert!(!out.contains(";; first line\n\n"), "unexpected blank between comments: {out:?}");
+        assert!(!out.contains(";; second line\n\n"), "unexpected blank after last comment: {out:?}");
+        assert!(out.contains(";; first line\n;; second line\n"), "comments must be adjacent: {out:?}");
+    }
+
+    #[test]
+    fn blank_line_before_comment_annotating_form() {
+        // A form followed by a comment followed by a form: there should be a blank
+        // line BEFORE the comment (separating top-level forms) but NOT between the
+        // comment and the form it annotates.
+        let src = "(fn a [] 1)\n;; docs\n(fn b [] 2)\n";
+        let out = fmt(src);
+        // Blank line must appear before the comment.
+        assert!(out.contains("(fn a [] 1)\n\n;; docs"), "expected blank before comment: {out:?}");
+        // No blank line between comment and b.
+        assert!(!out.contains(";; docs\n\n(fn b"), "unexpected blank after comment: {out:?}");
+    }
+
+    #[test]
+    fn only_comment_top_level() {
+        // A file consisting entirely of comments should not crash or insert blank lines.
+        let src = ";; line 1\n;; line 2\n;; line 3\n";
+        let out = fmt(src);
+        assert!(!out.contains("\n\n"), "comments-only file must have no blank lines: {out:?}");
+    }
+
+    #[test]
+    fn idempotent_comment_annotated_form() {
+        // A comment stuck to the form it annotates must survive a second pass.
+        let src = "(fn a [] 1)\n\n;; docs\n(fn b [] 2)\n";
+        let out = fmt(src);
+        let again = fmt(&out);
+        assert_eq!(out, again, "comment-annotated form not idempotent");
+    }
+
+    #[test]
+    fn idempotent_multi_form_with_comments() {
+        // Simulate a realistic module header with comment groups above each fn.
+        let src = ";; module header\n\n(fn setup [] nil)\n\n;; main loop\n(fn run [] (setup))\n\n;; cleanup\n(fn teardown [] nil)\n";
+        let once = fmt(src);
+        let twice = fmt(&once);
+        assert_eq!(once, twice, "multi-form-with-comments not idempotent");
+    }
 }

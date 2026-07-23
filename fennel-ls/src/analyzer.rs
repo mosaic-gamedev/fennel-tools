@@ -35,6 +35,10 @@ pub struct DefinitionInfo {
     pub doc: Option<String>,
     /// True if the function accepts a rest arg (`& rest`) or varargs (`...`).
     pub variadic: bool,
+    /// True if the last body expression can produce multiple values (e.g. `(values ...)`).
+    /// Used to suppress false-positive arity warnings when this function is the last arg
+    /// in a call: Lua expands multi-return calls in tail-argument position.
+    pub returns_multiple: bool,
 }
 
 // ── Symbol reference ─────────────────────────────────────────────────────────
@@ -64,6 +68,8 @@ pub struct Scope {
 pub struct AnalysisWarning {
     pub message: String,
     pub span: Span,
+    /// Span of the original definition, for shadow warnings.
+    pub related_span: Option<Span>,
 }
 
 #[derive(Debug, Default)]
@@ -207,6 +213,7 @@ impl Analyzer {
                 params,
                 doc,
                 variadic: false,
+                returns_multiple: false,
             },
         );
         self.result.syms.push(SymbolEntry {
@@ -217,9 +224,12 @@ impl Analyzer {
         });
         if let Some(scope_idx) = self.current_scope() {
             if name != "_" && self.result.scopes[scope_idx].bindings.contains_key(name) {
+                let orig_byte = self.result.scopes[scope_idx].bindings[name];
+                let related_span = self.result.defs.get(&orig_byte).map(|d| d.span.clone());
                 self.result.warnings.push(AnalysisWarning {
                     message: format!("`{}` is already defined in this scope", name),
                     span: span.clone(),
+                    related_span,
                 });
             }
             self.result.scopes[scope_idx]
@@ -370,7 +380,8 @@ impl Analyzer {
 
     /// Warn when a resolved function is called with the wrong number of arguments.
     fn check_arity(&mut self, forms: &[AstNode], list_span: &Span) {
-        let warn_msg = (|| -> Option<String> {
+        // Phase 1: collect callee info (all borrows released before phase 2).
+        let info = (|| -> Option<(String, usize)> {
             let head_name = match &forms.first()?.node {
                 Form::Symbol(s) => s.as_str(),
                 _ => return None,
@@ -381,22 +392,52 @@ impl Analyzer {
                 return None;
             }
             let expected = def.params.as_ref()?.len();
-            let actual = forms.len() - 1;
-            if actual != expected {
-                Some(format!(
-                    "`{}` expects {} argument{} but got {}",
-                    def.name,
-                    expected,
-                    if expected == 1 { "" } else { "s" },
-                    actual,
-                ))
-            } else {
-                None
-            }
+            Some((def.name.clone(), expected))
         })();
-        if let Some(msg) = warn_msg {
-            self.result.warnings.push(AnalysisWarning { message: msg, span: list_span.clone() });
+
+        let Some((fn_name, expected)) = info else { return };
+        let actual = forms.len() - 1;
+
+        if actual == expected {
+            return;
         }
+
+        // Under-arity: suppress when the last argument might expand to multiple
+        // values at runtime.  In Lua, a call in last-argument position expands
+        // to all of its return values, so `(f (multi-ret))` is valid even if
+        // `f` takes more than one parameter.
+        if actual < expected {
+            let last_may_expand = forms.last().map_or(false, |last| {
+                if tail_may_return_multiple(last) {
+                    return true;
+                }
+                if let Form::List(inner) = &last.node {
+                    if let Some(Form::Symbol(name)) = inner.first().map(|n| &n.node) {
+                        let root = name.split(['.', ':']).find(|s| !s.is_empty()).unwrap_or(name);
+                        if let Some(db) = self.lookup(root) {
+                            return self.result.defs.get(&db)
+                                .map_or(false, |d| d.returns_multiple);
+                        }
+                    }
+                }
+                false
+            });
+            if last_may_expand {
+                return;
+            }
+        }
+
+        self.result.warnings.push(AnalysisWarning {
+            message: format!(
+                "`{}` expects {} argument{} but got {}",
+                fn_name,
+                expected,
+                if expected == 1 { "" } else { "s" },
+                actual,
+            ),
+            span: list_span.clone(),
+            related_span: None,
+        });
     }
 
     // ── (local name val) / (var name val) / (global name val) ────────────────
@@ -434,6 +475,7 @@ impl Analyzer {
                                     def.name
                                 ),
                                 span: forms[1].span.clone(),
+                                related_span: None,
                             });
                         }
                         DefKind::Var => {
@@ -507,12 +549,16 @@ impl Analyzer {
             }
         }
 
-        // Patch the function's definition with param names and variadic flag
+        // Detect whether the last body expression may return multiple values.
+        let returns_multiple = body.last().map_or(false, tail_may_return_multiple);
+
+        // Patch the function's definition with param names, variadic flag, and return info.
         if let Some(db) = fn_def_byte {
             if let Some(def) = self.result.defs.get_mut(&db) {
                 def.params = Some(param_names.clone());
                 def.doc = doc.clone();
                 def.variadic = variadic;
+                def.returns_multiple = returns_multiple;
             }
         }
 
@@ -1212,6 +1258,31 @@ impl Analyzer {
     }
 }
 
+// ── Multi-value return detection ──────────────────────────────────────────────
+
+/// Returns true when `node`, evaluated in tail position, may produce multiple
+/// values.  Used to suppress false-positive arity warnings: Lua expands a
+/// multi-return call that appears as the *last* argument in a call site.
+fn tail_may_return_multiple(node: &AstNode) -> bool {
+    match &node.node {
+        Form::List(forms) => match head_sym(forms) {
+            Some("values") => true,
+            Some("do") | Some("when") | Some("unless") => {
+                forms.last().map_or(false, tail_may_return_multiple)
+            }
+            Some("let") | Some("with-open") => {
+                forms.last().map_or(false, tail_may_return_multiple)
+            }
+            Some("if") => {
+                forms.get(2).map_or(false, tail_may_return_multiple)
+                    || forms.get(3).map_or(false, tail_may_return_multiple)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
@@ -1242,6 +1313,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
         analyzer.result.warnings.push(AnalysisWarning {
             message: format!("`{}` is never mutated; use `local` instead of `var`", name),
             span,
+            related_span: None,
         });
     }
 
@@ -1264,6 +1336,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
         analyzer.result.warnings.push(AnalysisWarning {
             message: format!("`{}` is defined but never used", name),
             span,
+            related_span: None,
         });
     }
 
@@ -1282,6 +1355,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
         analyzer.result.warnings.push(AnalysisWarning {
             message: format!("parameter `{}` is unused", name),
             span,
+            related_span: None,
         });
     }
 
@@ -2113,6 +2187,28 @@ mod tests {
         assert_eq!(def_kind(&r, "my-mac"), Some(DefKind::Macro));
     }
 
+    #[test]
+    fn macro_form_call_site_not_unknown() {
+        // (macro ...) creates a def; the call site should resolve, not be flagged.
+        let r = analyze_src("(macro my-mac [x] x) (my-mac 1)");
+        assert!(!is_unknown(&r, "my-mac"), "macro call site must resolve");
+    }
+
+    #[test]
+    fn macros_form_call_site_not_unknown() {
+        // (macros {...}) also creates defs; call sites must resolve.
+        let r = analyze_src("(macros {my-mac (fn [x] x)}) (my-mac 99)");
+        assert!(!is_unknown(&r, "my-mac"), "macros-form call site must resolve");
+    }
+
+    #[test]
+    fn import_macros_call_site_not_unknown() {
+        // (import-macros {: foo} :lib) creates a def for `foo`; calling it must resolve.
+        let r = analyze_src("(import-macros {: foo :bar baz} :mylib) (foo 1) (baz 2)");
+        assert!(!is_unknown(&r, "foo"), "import-macros call site `foo` must resolve");
+        assert!(!is_unknown(&r, "baz"), "import-macros call site `baz` must resolve");
+    }
+
     // ── Destructuring edge cases ──────────────────────────────────────────────
 
     #[test]
@@ -2517,6 +2613,34 @@ mod tests {
     }
 
     #[test]
+    fn bare_underscore_in_body_not_unknown() {
+        // `_` is a builtin discard. Referencing it in body position should not
+        // produce an "unknown identifier" warning. It IS unusual code (you normally
+        // don't read a discard), but the LSP should not emit a spurious diagnostic.
+        let r = analyze_src("(fn f [_] _)");
+        assert!(!is_unknown(&r, "_"),
+            "_ in body must not be flagged as unknown identifier");
+    }
+
+    #[test]
+    fn multiple_underscore_params_no_shadow_warning() {
+        // (fn f [_ _] nil) — two _ params: no shadow warning, no unused warning.
+        assert!(!has_warning("(fn f [_ _] nil)", "already defined"),
+            "multiple _ params must not trigger shadow warning");
+        assert!(!has_warning("(fn f [_ _] nil)", "parameter"),
+            "_ params must not trigger unused-param warning");
+    }
+
+    #[test]
+    fn underscore_loop_var_no_warning() {
+        // (each [_ v (ipairs t)] v) — _ discards the key, v is used.
+        assert!(!has_warning("(each [_ v (ipairs t)] v)", "unused"),
+            "_ loop var must not trigger unused warning");
+        assert!(!is_unknown(&analyze_src("(each [_ v (ipairs t)] v)"), "_"),
+            "_ loop var must not trigger unknown-identifier");
+    }
+
+    #[test]
     fn multiple_params_one_unused_warns_correctly() {
         let r = analyze_src("(fn f [a b] a)");
         assert!(r.warnings.iter().any(|w| w.message.contains("`b`") && w.message.contains("unused")),
@@ -2580,6 +2704,83 @@ mod tests {
     fn arity_recursive_call_no_false_warn() {
         // `(fn fact [n] (fact n))` — 1 arg, 1 param: no warning
         assert!(!has_warning("(fn fact [n] (fact n))", "argument"));
+    }
+
+    #[test]
+    fn arity_values_direct_as_last_arg_suppressed() {
+        // (values 1 2) in last-arg position expands at runtime → no warning
+        assert!(!has_warning("(fn f [a b] nil) (f (values 1 2))", "argument"));
+    }
+
+    #[test]
+    fn arity_values_with_explicit_first_arg_suppressed() {
+        // (f x (values 1 2)) where f takes 3 params: x fills slot 1, values fills 2+3
+        assert!(!has_warning("(fn f [a b c] nil) (local x 1) (f x (values 1 2))", "argument"));
+    }
+
+    #[test]
+    fn arity_multi_return_fn_suppresses_under_arity() {
+        // (fn pair [] (values 1 2)) is the last arg — its expansion may satisfy arity
+        assert!(!has_warning(
+            "(fn pair [] (values 1 2)) (fn add [a b] nil) (add (pair))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_multi_return_fn_with_leading_arg_suppressed() {
+        // (add x (pair)) — x fills slot 1, pair expands to fill slots 2+3
+        assert!(!has_warning(
+            "(fn pair [] (values 1 2)) (fn add [a b c] nil) (local x 1) (add x (pair))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_single_return_fn_still_warns() {
+        // (fn f [] nil) returns one value; (g (f)) with g taking 2 should still warn
+        assert!(has_warning(
+            "(fn f [] nil) (fn g [a b] nil) (g (f))",
+            "expects 2 arguments but got 1",
+        ));
+    }
+
+    #[test]
+    fn arity_over_supply_always_warns_regardless_of_multi_return() {
+        // Too many explicit args is always wrong, even if last arg is multi-return
+        assert!(has_warning(
+            "(fn pair [] (values 1 2)) (fn f [a] nil) (local x 1) (f x (pair))",
+            "expects 1 argument but got 2",
+        ));
+    }
+
+    #[test]
+    fn arity_values_in_do_body_marks_returns_multiple() {
+        // A fn whose body is (do (values 1 2)) also propagates returns_multiple
+        assert!(!has_warning(
+            "(fn f [] (do (values 1 2))) (fn g [a b] nil) (g (f))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_values_in_if_branch_marks_returns_multiple() {
+        // Both branches return multiple values → returns_multiple
+        assert!(!has_warning(
+            "(fn f [x] (if x (values 1 2) (values 3 4))) (fn g [a b] nil) (g (f true))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_non_last_arg_multi_return_still_warns() {
+        // Lua truncates non-last arguments to 1 value; (pair) in non-last position
+        // does NOT expand, so the count is still wrong.
+        // (f (pair) x) where f takes 3: pair is truncated to 1, x is 1 → actual=2, expected=3
+        assert!(has_warning(
+            "(fn pair [] (values 1 2)) (fn f [a b c] nil) (local x 1) (f (pair) x)",
+            "expects 3 arguments but got 2",
+        ));
     }
 
     // ── module_bindings ───────────────────────────────────────────────────────

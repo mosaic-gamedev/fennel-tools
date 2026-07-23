@@ -1,207 +1,268 @@
-# LSP Feature Status
+# fennel-ls LSP Feature Coverage
+
+Status legend: **✅ done** · **❌ not implemented** · **N/A not applicable**
 
 ---
 
-## Implemented
+## Lifecycle
 
-### Text synchronisation
-Incremental sync (`TextDocumentSyncKind::INCREMENTAL`). The client sends only
-the changed ranges; each change event is applied in sequence to the in-memory
-text, then the full pipeline re-runs. The lexer → parser → analyzer pipeline
-re-runs on each `didOpen`, `didChange`, and `didSave`.
-
-### Diagnostics
-Pushed to the client after every sync event. Sources:
-
-| Kind | Severity | Examples |
-|---|---|---|
-| Parse errors | ERROR | Unclosed delimiter, unexpected token |
-| Semantic warnings | WARNING | `set` on an immutable `local`, `var` that is never mutated, same-scope shadowing |
-| Unknown identifiers | WARNING | Symbol not in scope, not a builtin, not in `known_global` fallback list |
-| Arity errors | WARNING | Calling a function with too few or too many arguments (suppressed for variadic functions) |
-| Unused locals | WARNING | `local`/`let` binding never referenced (suppress with `_`-prefixed name) |
-| Unused params | WARNING | Function parameter never referenced (suppress with `_`-prefixed name) |
-
-Multisym names (`io.open`, `obj:method`) are suppressed if the root (`io`,
-`obj`) is known.
-
-### Hover
-- **User-defined names:** renders `(kind name [params])` in a fenced Fennel
-  code block, followed by the inline docstring if the function body begins
-  with a string literal.
-- **Built-in names:** renders the signature and description from `docs.rs`.
-  Multisym lookup (`string.format`) resolves to the root entry (`string`).
-- **Cross-file module members:** `(local utils (require :utils))` followed by
-  hovering on `utils.greet` shows `greet`'s signature and docstring from
-  `utils.fnl`.
-- **Custom global docs:** signatures and docs from `global_docs` entries in
-  `.fennel-ls.toml` (see Configuration).
-
-### Go to definition
-Jumps to the binding site of the symbol under the cursor.
-- **Same-file:** resolves to the definition in the current file.
-- **Module members:** `utils.greet` → jumps to `greet`'s definition in `utils.fnl`.
-- **Require strings:** cursor on `:utils` inside `(require :utils)` → opens `utils.fnl`.
-
-### Find references
-Returns all use-sites of whichever definition the cursor is on (or the
-definition a reference points to). Includes the definition itself.
-- **Same-file:** all references in the current file.
-- **Cross-file:** if the cursor is on a top-level definition (or a multisym
-  reference to one), also returns every `binding.def_name` site in all open
-  files that import the definition's file.
-
-### Document highlight
-Same logic as find-references. Returns `WRITE` highlight kind for the
-definition and `READ` for uses.
-
-### Document symbols
-Lists every definition in the file (`local`, `var`, `global`, `fn`, `macro`,
-`param`, `loop-var`, destructured). Maps `DefKind` to LSP `SymbolKind`.
-
-### Workspace symbols (`workspace/symbol`)
-Searches all open files and the require-cache for definitions matching a query
-string (case-insensitive substring match). Returns the definition's name, kind,
-and location in its source file. Powered by `all_defs()` in `workspace.rs`.
-
-### Rename
-Renames all occurrences of a symbol.
-- **Same-file:** all occurrences of the binding in the current file.
-- **Cross-file:** if renaming a top-level definition (or a multisym that
-  resolves to one), also rewrites every `binding.old_name` to
-  `binding.new_name` across all open files that import the definition's file,
-  preserving the `.` or `:` separator.
-
-
-### Semantic tokens (`textDocument/semanticTokens/full`)
-Per-token classification for richer editor highlighting beyond what a static
-grammar provides. Token types: `function`, `parameter`, `variable`, `macro`.
-Modifiers: `definition` (binding site) and `readonly` (immutable bindings).
-Built-in references and unresolved symbols are omitted (grammar handles base
-coloring). Delta-encoded as required by the LSP spec.
-
-### Configuration file (`.fennel-ls.toml`)
-An optional file in the workspace root to configure the server without
-recompiling. Supported fields:
-
-```toml
-platform = "lua54"   # lua51 | lua52 | lua53 | lua54 (default) | luajit | luau
-known_globals = ["love", "vim", "hs"]
-```
-
-`platform` selects the active `BuiltinSet`, controlling which globals are
-known. `known_globals` suppresses unknown-identifier warnings for names that
-are not in any `BuiltinSet` (e.g. game framework or editor globals).
-
-### Completion
-Triggered on `(`, `[`, `{`, `.`, `:`.
-
-- Scope-local definitions, respecting lexical scope at the cursor position,
-  with param and docstring info where available.
-- All built-ins from the active `BuiltinSet`.
-- **Cross-file module members:** typing `utils.` after `(local utils (require :utils))`
-  offers all top-level exports from `utils.fnl` with labels like `utils.greet`.
-- Custom global docs from `.fennel-ls.toml` filtered to the current multisym prefix.
-- Deduplicated by name (innermost binding wins). Sorted alphabetically.
-- `CompletionItemKind` follows `DefKind` (Fn → FUNCTION, Macro → KEYWORD,
-  LoopVar/Param → VARIABLE, etc.) and `BuiltinKind` (Function → FUNCTION,
-  SpecialForm/Macro → KEYWORD, Value → MODULE).
-
-### Folding ranges (`textDocument/foldingRange`)
-Multi-line lists, sequences, and tables each produce a folding region. Nested
-structures each fold independently.
-
-### Signature help (`textDocument/signatureHelp`)
-Shows the parameter list of the function being called as the user types
-arguments. Triggered on `(` and space. The active parameter is highlighted as
-the cursor moves through the argument positions. Only fires when the head
-symbol resolves to a user-defined `fn` with a known parameter list.
-
-### Inlay hints (`textDocument/inlayHint`)
-Parameter-name hints at call sites — shows which parameter each positional
-argument maps to (e.g. `a:` before the first argument). Suppressed for
-`_`-prefixed parameters (conventional discard) and rest parameters (`& rest`).
-
-### Code actions
-- **`var → local` quickfix:** when a `var` binding was never mutated, rewrite the `var` keyword to `local`.
-- **Unknown-identifier stub:** when the cursor is on an unknown-identifier warning, insert `(local name nil)` on the line above as a starting point.
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `initialize` | ✅ | Returns full capability set |
+| `initialized` | ✅ | Registers `*.fnl` file watcher |
+| `shutdown` | ✅ | |
+| `exit` | ✅ | Handled by tower-lsp |
+| `$/cancelRequest` | ✅ | Handled by tower-lsp |
+| `$/progress` | ❌ | Analysis completes in < 1 ms; there is no long-running operation to report progress for |
+| `window/showMessage` | ❌ | This is a server-to-client send (not a handler); we use `logMessage` instead — modal popups are disruptive UX |
 
 ---
 
-### Formatting (`textDocument/formatting`)
-Pretty-printer, enabled by default. Disable by passing `--no-formatting` when
-starting the server (e.g. `fennel-ls --no-formatting`).
+## Text Document Synchronization
 
-When enabled:
-- Short forms (≤ 80 characters flat) are kept on one line.
-- **Body forms** (`fn`, `let`, `if`, `when`, `match`, `each`, `for`, etc.) pack
-  atom/sequence arguments onto the head line; the first compound (`List`/`Table`)
-  child breaks to a new indented line (2-space indent, same as Clojure convention).
-- **Regular calls** pack arguments greedily until the column limit is exceeded,
-  then break.
-- **Comments** are preserved in-place and always placed on their own line.
-- Blank line between each pair of top-level forms; no blank line between a
-  leading comment and the form it annotates.
-- Single trailing newline.
-- Returns no edits (no-op) if the source has parse errors, so broken files are
-  never mangled.
-- Atoms are emitted verbatim from the source text (preserves `0xff`, string
-  escapes, and other exact spellings).
-
-## Should be implemented
-
-### Macro expansion at call sites
-Macros introduce names into the caller's scope that the static analyzer
-cannot see. The right long-term fix is to spawn `fennel --expand` on a call
-site and parse the result. A feature flag can gate this on the presence of
-Fennel on `PATH`.
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/didOpen` | ✅ | Parses, analyzes, publishes diagnostics |
+| `textDocument/didChange` | ✅ | Incremental and full-text sync |
+| `textDocument/willSave` | ✅ | Acknowledged notification |
+| `textDocument/willSaveWaitUntil` | ✅ | Returns formatting edits before save |
+| `textDocument/didSave` | ✅ | Re-analyzes on save |
+| `textDocument/didClose` | ✅ | Clears diagnostics, removes from workspace |
 
 ---
 
-## Not worth implementing
+## Diagnostics
 
-### Type checking / type inference
-Fennel and Lua have no static type system. Inferring types would require
-whole-program analysis, an understanding of Lua metatables, and integration
-with LuaJIT's FFI — an enormous, open-ended effort. The payoff is low because
-users of a dynamically typed language don't expect type errors from their
-editor.
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Push diagnostics (`publishDiagnostics`) | ✅ | Sent after every open/change/save |
+| Parse errors | ✅ | Syntax errors with spans |
+| Undefined identifier warnings | ✅ | Respects `known_globals` from config |
+| Unused local warnings | ✅ | Skips `_`-prefixed names |
+| Unused parameter warnings | ✅ | Skips `_`-prefixed and destructured params |
+| Immutability violation (`set` on `local`) | ✅ | Suggests `var` |
+| Never-mutated `var` | ✅ | Suggests `local` |
+| Shadow warnings | ✅ | Warns on same-scope redefinition |
+| Arity mismatch | ✅ | Checks call sites against param counts |
+| `source` field | ✅ | All diagnostics tagged `"fennel-ls"` |
+| `code` field | ✅ | String codes: `shadow`, `unused-local`, `unused-param`, `never-mutated`, `immutable`, `arity`, `unknown` |
+| `relatedInformation` | ✅ | Shadow warnings link to original definition |
+| Diagnostic tags (`UNNECESSARY`) | ✅ | Unused locals/params shown dimmed in editors |
+| Pull diagnostics (`textDocument/diagnostic`) | ❌ | The push model covers all real-world use cases; pull (LSP 3.17) would require duplicating the diagnostic pipeline into a separate request/response path for no user-visible benefit |
+| Workspace-level pull diagnostics | ❌ | Same reason as above; also requires `workspace/diagnostic` which is LSP 3.17 and not yet in our lsp-types version |
 
-### Call hierarchy (`callHierarchy/incomingCalls`, `outgoingCalls`)
-Fennel is functional: functions are first-class values, higher-order functions
-are idiomatic, and tables-of-functions are common. Static call graphs are
-therefore misleading — they miss dynamic dispatch entirely and surface false
-call sites for things like `(each [_ f (ipairs handlers)] (f))`. The feature
-would have low signal and high noise.
+---
 
-### Inlay hints for types
-No type system to infer from. Parameter-name hints at call sites are
-implemented (see above); type-level hints have nothing to anchor to.
+## Hover
 
-### `textDocument/implementation` and `textDocument/typeDefinition`
-These navigate from a type or interface declaration to its implementation, or
-from a usage to the type definition. Lua has no interfaces or abstract types.
-These requests have no sensible semantic in Fennel.
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/hover` | ✅ | |
+| Hover on local/fn definitions | ✅ | Shows signature and inline docstring |
+| Hover on builtin specials | ✅ | Fennel built-in docs embedded |
+| Hover on Lua builtins | ✅ | Platform-specific (LuaJIT / Lua 5.x) |
+| Hover on globals from config | ✅ | Reads `global_docs` from `.fennel-ls.toml` |
+| Hover on cross-file symbols | ✅ | Follows require chain |
+| Markdown content format | ✅ | Code fences + docstring prose |
 
-### Linked editing ranges
-Allows renaming paired tags simultaneously (HTML `<div>…</div>` use case).
-Lisp has no paired open/close constructs beyond brackets, and bracket matching
-is already handled by the editor's built-in parser or tree-sitter. There is
-nothing to link.
+---
 
-### Selection range (`textDocument/selectionRange`)
-Structural selection (expand selection to enclosing s-expression, then to
-the enclosing form, etc.) is useful in Lisps, but editors already provide
-this through tree-sitter or their own bracket-aware selection logic. The LSP
-version would duplicate what the editor already does better.
+## Navigation
 
-### Moniker (`textDocument/moniker`)
-Cross-repository symbol resolution for package registries. Fennel has no
-package registry in the npm/crates.io sense. Not applicable.
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/definition` | ✅ | Same-file and cross-file via `require` |
+| `textDocument/declaration` | ✅ | Alias to definition (no separate declaration in Fennel) |
+| `textDocument/references` | ✅ | Same-file and cross-file |
+| `textDocument/documentHighlight` | ✅ | Highlights all uses of symbol under cursor |
+| `textDocument/typeDefinition` | N/A | Fennel is dynamically typed; there are no static types to navigate to |
+| `textDocument/implementation` | N/A | No interface/implementation split in Fennel |
 
-### Code lens
-Code lenses show actionable information inline in the editor (e.g. "Run test",
-"N references"). Every useful lens for Fennel would require executing code
-(running tests, evaluating expressions) or cross-file reference counts that
-are expensive to maintain. The static analyzer alone cannot produce lens
-content worth showing.
+---
+
+## Completion
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/completion` | ✅ | |
+| Local bindings | ✅ | All in-scope locals |
+| Fennel special forms & macros | ✅ | |
+| Lua / Fennel builtins | ✅ | Platform-aware |
+| Module member completion (`mod.`) | ✅ | Follows `require` to imported file's exports |
+| Method call completion (`obj:`) | ✅ | |
+| Globals from config | ✅ | `known_globals` + `global_docs` keys |
+| Trigger characters | ✅ | `(`, `[`, `{`, `.`, `:` |
+| `completionItem/resolve` | ❌ | We already send `label`, `kind`, `detail`, `documentation`, and `insertText` in the initial response. Resolve exists to defer expensive fields until the user focuses an item — there is nothing left to defer |
+
+---
+
+## Signature Help
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/signatureHelp` | ✅ | |
+| Parameter list display | ✅ | |
+| Active parameter highlighting | ✅ | Tracks cursor position within arg list |
+| Trigger characters | ✅ | `(` and space |
+| Variadic functions | ✅ | Rest args shown as `& rest` |
+
+---
+
+## Symbols
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/documentSymbol` | ✅ | Hierarchical (`DocumentSymbol` tree) |
+| `workspace/symbol` | ✅ | Searches all open files |
+| `workspaceSymbol/resolve` | ❌ | We already return `name`, `kind`, `location`, and `containerName` in the initial list. Nothing to add in a resolve step |
+| Functions (`fn`) | ✅ | |
+| Locals (`local`, `var`) | ✅ | |
+| Nested definitions | ✅ | Inner `fn` shown as child of enclosing form |
+
+---
+
+## Code Actions
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/codeAction` | ✅ | |
+| Quickfix: `var → local` | ✅ | Triggered by "never mutated" diagnostic |
+| Quickfix: Remove unused local | ✅ | Removes whole `(local ...)` form |
+| Refactor: `local → var` | ✅ | Offered on any `local` binding name |
+| Refactor: Wrap in `(do ...)` | ✅ | Offered for any non-empty selection |
+| `codeAction/resolve` | ❌ | We already compute and return the full `WorkspaceEdit` in the initial response. Resolve exists to defer edit computation until the user actually applies an action — our edits are cheap to compute upfront |
+| `textDocument/codeLens` | ✅ | Shows reference count above each `fn` definition |
+| `codeLens/resolve` | ❌ | We already include the `command.title` (reference count) in the initial lens. Nothing to resolve |
+
+---
+
+## Rename
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/prepareRename` | ✅ | Returns range + placeholder; rejects non-renameable positions |
+| `textDocument/rename` | ✅ | Cross-file; updates all references including module-qualified names |
+
+---
+
+## Formatting
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/formatting` | ✅ | Full-file; powered by `fennel-format` |
+| `textDocument/rangeFormatting` | ✅ | Expands selection to complete top-level forms |
+| `textDocument/onTypeFormatting` | ✅ | Auto-indents on Enter via forward-scan paren tracker |
+
+---
+
+## Folding & Selection
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/foldingRange` | ✅ | AST-based; folds `fn`, `let`, `do`, etc. |
+| `textDocument/selectionRange` | ✅ | Expands selection up the AST |
+| `textDocument/linkedEditingRange` | N/A | Designed for paired HTML/XML tags; no equivalent construct in Fennel |
+
+---
+
+## Call Hierarchy
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/prepareCallHierarchy` | ✅ | Resolves cursor to named `fn` definition |
+| `callHierarchy/incomingCalls` | ✅ | Cross-file; groups multiple call sites per caller |
+| `callHierarchy/outgoingCalls` | ✅ | Walks fn body AST; deduplicates by callee |
+
+---
+
+## Type Hierarchy
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/prepareTypeHierarchy` | N/A | Fennel is dynamically typed; there are no static types to build a hierarchy from |
+| `typeHierarchy/supertypes` | N/A | |
+| `typeHierarchy/subtypes` | N/A | |
+
+---
+
+## Semantic Tokens
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/semanticTokens/full` | ✅ | Functions, parameters, variables, macros; definition + readonly modifiers |
+| `textDocument/semanticTokens/full/delta` | ✅ | Single-edit delta computed from a per-file flat-u32 cache |
+| `textDocument/semanticTokens/range` | ✅ | Decodes the full token stream and filters to the requested line range |
+
+---
+
+## Inlay Hints
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/inlayHint` | ✅ | Parameter name hints at call sites |
+| `inlayHint/resolve` | ❌ | We already return the full label and position in the initial response. Nothing to resolve |
+
+---
+
+## Document Links
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/documentLink` | ✅ | `(require :mod)` → clickable link to resolved file |
+| `documentLink/resolve` | ❌ | We already include `target` (file URI) and `tooltip` (path) in the initial link. Nothing to resolve |
+
+---
+
+## Miscellaneous Text Document
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `textDocument/documentColor` | N/A | No color literals in Fennel |
+| `textDocument/colorPresentation` | N/A | |
+| `textDocument/inlineValue` | ✅ | Returns `InlineValueVariableLookup` for every binding in scope at the stopped location; DAP resolves the actual values |
+| `textDocument/moniker` | ❌ | Used by code-intelligence indexers (LSIF, SCIP, Sourcegraph) to assign globally unique names to symbols. Not an editing feature; only needed if publishing an index |
+
+---
+
+## Workspace Management
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `workspace/didChangeConfiguration` | ✅ | Re-reads `.fennel-ls.toml`; re-publishes diagnostics |
+| `workspace/symbol` | ✅ | |
+| `workspace/didChangeWatchedFiles` | ✅ | Reloads required-but-not-open files changed on disk |
+| `workspace/didCreateFiles` | ✅ | Invalidates require cache; indexes new file |
+| `workspace/didRenameFiles` | ✅ | Moves cache entry; reloads file at new path |
+| `workspace/didDeleteFiles` | ✅ | Removes from workspace; invalidates cache |
+| `workspace/willRenameFiles` | ✅ | Returns edits updating `(require :old)` → `(require :new)` in all open files |
+| `workspace/willCreateFiles` | ❌ | The server has no edits to propose before a file is created — there is no existing content to rewrite |
+| `workspace/willDeleteFiles` | ❌ | Could theoretically offer to remove `(require :mod)` from files that depend on the deleted file, but this is destructive and hard to do correctly (the binding may be used in complex ways). Covered well enough by existing diagnostics that will flag the broken require after deletion |
+| `workspace/executeCommand` | ❌ | No custom commands are currently defined. Would need a concrete use case (e.g. `fennel-ls.reloadConfig`) before wiring this up |
+| `workspace/diagnostic` (pull) | ❌ | LSP 3.17 pull model. Push (`publishDiagnostics`) covers all practical use cases and is simpler to reason about. Adding pull would require maintaining a separate diagnostic-state machine in parallel with the push pipeline |
+
+---
+
+## Summary
+
+| Category | ✅ Done | ❌ Not Implemented | N/A |
+|----------|---------|-------------------|-----|
+| Lifecycle | 5 | 2 | 0 |
+| Text Sync | 6 | 0 | 0 |
+| Diagnostics | 13 | 2 | 0 |
+| Hover | 7 | 0 | 0 |
+| Navigation | 4 | 0 | 2 |
+| Completion | 8 | 1 | 0 |
+| Signature Help | 5 | 0 | 0 |
+| Symbols | 6 | 1 | 0 |
+| Code Actions | 6 | 2 | 0 |
+| Rename | 2 | 0 | 0 |
+| Formatting | 3 | 0 | 0 |
+| Folding & Selection | 2 | 0 | 1 |
+| Call Hierarchy | 3 | 0 | 0 |
+| Type Hierarchy | 0 | 0 | 3 |
+| Semantic Tokens | 3 | 0 | 0 |
+| Inlay Hints | 1 | 1 | 0 |
+| Document Links | 1 | 1 | 0 |
+| Misc Text Document | 1 | 1 | 2 |
+| Workspace Management | 7 | 4 | 0 |
+| **Total** | **83** | **15** | **8** |

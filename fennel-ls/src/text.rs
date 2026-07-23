@@ -232,4 +232,72 @@ mod tests {
         assert_eq!(range.start, pos(0, 0));
         assert_eq!(range.end,   pos(1, 5));
     }
+
+    // ── CRLF ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn byte_to_position_crlf_first_line() {
+        // "hello\r\nworld" — \r is part of line 0, \n is the line separator.
+        // byte_to_position splits on \n only, so \r counts as a column.
+        let text = "hello\r\nworld";
+        assert_eq!(byte_to_position(text, 0), pos(0, 0)); // h
+        assert_eq!(byte_to_position(text, 4), pos(0, 4)); // o
+        assert_eq!(byte_to_position(text, 5), pos(0, 5)); // \r (part of line 0)
+        assert_eq!(byte_to_position(text, 6), pos(0, 6)); // \n (still line 0 in prefix)
+        assert_eq!(byte_to_position(text, 7), pos(1, 0)); // w (first char of line 1)
+    }
+
+    #[test]
+    fn position_to_byte_crlf() {
+        let text = "hello\r\nworld";
+        assert_eq!(position_to_byte(text, pos(0, 0)), Some(0)); // h
+        assert_eq!(position_to_byte(text, pos(0, 5)), Some(5)); // \r
+        assert_eq!(position_to_byte(text, pos(1, 0)), Some(7)); // w
+        assert_eq!(position_to_byte(text, pos(1, 4)), Some(11)); // d
+    }
+
+    #[test]
+    fn round_trip_crlf_file() {
+        // Every char boundary in a CRLF file must survive byte→position→byte.
+        let text = "fn greet\r\n  \"hello\"\r\nend\r\n";
+        let mut byte = 0;
+        for ch in text.chars() {
+            let p = byte_to_position(text, byte);
+            let back = position_to_byte(text, p).expect("CRLF round-trip must succeed");
+            assert_eq!(back, byte, "CRLF round-trip failed at byte {byte} (char {ch:?})");
+            byte += ch.len_utf8();
+        }
+    }
+
+    // ── Non-ASCII in span_to_range (diagnostic positions) ────────────────────
+
+    #[test]
+    fn span_to_range_after_bmp_non_ascii() {
+        use crate::lexer::Span;
+        // "aéfoo" — é is U+00E9 (2 UTF-8 bytes, 1 UTF-16 unit)
+        // `foo` starts at byte 3 (a=0, é=1..2, f=3)
+        // In UTF-16: col of f = 2 (a=0→1, é=1→2, f=2→col 2)
+        let text = "a\u{00E9}foo";
+        let span = Span { start: 3, end: 6, line: 0, col: 3, end_line: 0, end_col: 6 };
+        let range = span_to_range(text, &span);
+        // byte_to_position uses utf16_len, so start.character must be 2 (not 3)
+        assert_eq!(range.start, pos(0, 2),
+            "span_to_range start must use UTF-16 offset: got {:?}", range.start);
+        assert_eq!(range.end, pos(0, 5),
+            "span_to_range end must use UTF-16 offset: got {:?}", range.end);
+    }
+
+    #[test]
+    fn span_to_range_after_supplementary_plane_char() {
+        use crate::lexer::Span;
+        // "🎉foo" — 🎉 is U+1F389 (4 UTF-8 bytes, 2 UTF-16 units)
+        // `foo` starts at byte 4
+        // UTF-16 col of f = 2 (🎉 takes 2 UTF-16 units)
+        let text = "\u{1F389}foo";
+        let span = Span { start: 4, end: 7, line: 0, col: 4, end_line: 0, end_col: 7 };
+        let range = span_to_range(text, &span);
+        assert_eq!(range.start, pos(0, 2),
+            "span_to_range must count supplementary-plane char as 2 UTF-16 units: got {:?}", range.start);
+        assert_eq!(range.end, pos(0, 5), "got {:?}", range.end);
+    }
 }

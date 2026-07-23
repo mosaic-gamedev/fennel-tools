@@ -1,6 +1,8 @@
 mod analyzer;
 mod config;
 mod docs;
+#[cfg(feature = "embedded-fennel")]
+mod expander;
 mod fmt;
 mod lexer;
 mod parser;

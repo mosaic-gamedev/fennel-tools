@@ -8,7 +8,11 @@ description = "A language server for the Fennel programming language (Rust rewri
 name = "fennel-ls"
 path = "src/main.rs"
 
+[features]
+embedded-fennel = ["dep:mlua"]
+
 [dependencies]
+mlua = { version = "0.9", features = ["luajit", "vendored"], optional = true }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
