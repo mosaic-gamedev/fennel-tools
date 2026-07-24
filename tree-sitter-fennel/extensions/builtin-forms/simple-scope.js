@@ -14,7 +14,7 @@ const forms = {};
 	'global',
 ].forEach(name => forms[name] = $ => form($,
 		name,
-		$.binding_pair,
+		pair($, { lhs: $._binding }, { rhs: $._sexp }),
 	)
 );
 
