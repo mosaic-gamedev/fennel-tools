@@ -1099,6 +1099,28 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
+
+                // Table-literal field completions: `t.` where `t` is a local
+                // bound to a table constructor with static keys.
+                let pfx_root = pfx.split(['.', ':']).next().unwrap_or("");
+                if !pfx_root.is_empty() {
+                    let table_def = file.analysis.defs_at(byte)
+                        .into_iter()
+                        .find(|d| d.name == pfx_root)
+                        .and_then(|d| d.table_fields.clone());
+                    if let Some(fields) = table_def {
+                        for field in fields {
+                            let full_label = format!("{}.{}", pfx_root, field);
+                            if seen.insert(full_label.clone()) {
+                                items.push(CompletionItem {
+                                    label: full_label,
+                                    kind: Some(CompletionItemKind::FIELD),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
             }
 
             items.sort_by(|a, b| a.label.cmp(&b.label));
@@ -2320,8 +2342,10 @@ fn split_multisym(name: &str) -> Option<(&str, &str)> {
 
 /// Return a diagnostic code string for a warning message, or `None` for parse errors.
 fn warning_code(msg: &str) -> Option<NumberOrString> {
-    Some(NumberOrString::String(if msg.contains("already defined") {
+    Some(NumberOrString::String(if msg.contains("already defined") || msg.contains("shadows a binding") {
         "shadow"
+    } else if msg.contains("required but never used") {
+        "unused-require"
     } else if msg.contains("never used") {
         "unused-local"
     } else if msg.contains("parameter") && msg.contains("unused") {
@@ -2341,7 +2365,10 @@ fn warning_code(msg: &str) -> Option<NumberOrString> {
 
 /// Return `DiagnosticTag::UNNECESSARY` for warnings about dead/unused code.
 fn warning_tags(msg: &str) -> Option<Vec<DiagnosticTag>> {
-    if msg.contains("never used") || (msg.contains("parameter") && msg.contains("unused")) {
+    if msg.contains("required but never used")
+        || msg.contains("never used")
+        || (msg.contains("parameter") && msg.contains("unused"))
+    {
         Some(vec![DiagnosticTag::UNNECESSARY])
     } else {
         None
@@ -2740,7 +2767,7 @@ mod tests {
         params: Option<Vec<String>>,
         doc: Option<String>,
     ) -> DefinitionInfo {
-        DefinitionInfo { name: name.into(), kind, span: dummy_span(), params, doc, variadic: false, returns_multiple: false }
+        DefinitionInfo { name: name.into(), kind, span: dummy_span(), params, doc, variadic: false, returns_multiple: false, table_fields: None }
     }
 
     // ── format_definition ─────────────────────────────────────────────────────

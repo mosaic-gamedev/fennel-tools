@@ -39,6 +39,9 @@ pub struct DefinitionInfo {
     /// Used to suppress false-positive arity warnings when this function is the last arg
     /// in a call: Lua expands multi-return calls in tail-argument position.
     pub returns_multiple: bool,
+    /// Static field names for table literals (`{:a 1 :b 2}` → `["a", "b"]`).
+    /// Only set when the binding is a table with all-literal keys. Used for field completions.
+    pub table_fields: Option<Vec<String>>,
 }
 
 // ── Symbol reference ─────────────────────────────────────────────────────────
@@ -83,6 +86,8 @@ pub struct AnalysisResult {
     pub warnings: Vec<AnalysisWarning>,
     /// Maps local binding name → required module name for `(local x (require :mod))`.
     pub module_bindings: HashMap<String, String>,
+    /// Maps def-byte → required module name for require bindings (used for unused-require check).
+    pub require_def_bytes: HashMap<u32, String>,
 }
 
 impl AnalysisResult {
@@ -162,6 +167,23 @@ fn extract_require_module(node: &AstNode) -> Option<String> {
     None
 }
 
+/// Extract static field names from a table literal.
+/// Returns keyword and string keys found in pairs; skips computed keys silently.
+/// An empty vec means either not a table or no static keys were found.
+fn extract_table_keys(node: &AstNode) -> Vec<String> {
+    let Form::Table(fields) = &node.node else { return vec![] };
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i + 1 < fields.len() {
+        match &fields[i].node {
+            Form::Keyword(k) | Form::Str(k) => keys.push(k.clone()),
+            _ => {}
+        }
+        i += 2;
+    }
+    keys
+}
+
 // ── Analyzer ─────────────────────────────────────────────────────────────────
 
 struct Analyzer {
@@ -214,6 +236,7 @@ impl Analyzer {
                 doc,
                 variadic: false,
                 returns_multiple: false,
+                table_fields: None,
             },
         );
         self.result.syms.push(SymbolEntry {
@@ -442,19 +465,64 @@ impl Analyzer {
 
     // ── (local name val) / (var name val) / (global name val) ────────────────
 
+    /// Walk parent scopes and emit a warning if `name` is already bound in one.
+    /// Only called for explicit `local`/`var`/`let` bindings — not params or match patterns.
+    fn check_outer_shadow(&mut self, name: &str, span: &Span) {
+        if name.starts_with('_') {
+            return;
+        }
+        let current = match self.current_scope() {
+            Some(idx) => idx,
+            None => return,
+        };
+        let mut idx_opt = self.result.scopes[current].parent;
+        while let Some(idx) = idx_opt {
+            if let Some(&orig_byte) = self.result.scopes[idx].bindings.get(name) {
+                let related_span = self.result.defs.get(&orig_byte).map(|d| d.span.clone());
+                self.result.warnings.push(AnalysisWarning {
+                    message: format!("`{}` shadows a binding from an outer scope", name),
+                    span: span.clone(),
+                    related_span,
+                });
+                return;
+            }
+            idx_opt = self.result.scopes[idx].parent;
+        }
+    }
+
+    /// If `name_node` is a plain symbol and `rhs` is a table literal with static keys,
+    /// record those keys on the def so completions can offer `name.field`.
+    fn set_table_fields(&mut self, name_node: &AstNode, rhs: &AstNode) {
+        let Form::Symbol(_) = &name_node.node else { return };
+        let fields = extract_table_keys(rhs);
+        if fields.is_empty() {
+            return;
+        }
+        let byte = name_node.span.start;
+        if let Some(def) = self.result.defs.get_mut(&byte) {
+            def.table_fields = Some(fields);
+        }
+    }
+
     fn analyze_binding(&mut self, forms: &[AstNode], kind: DefKind) {
         if forms.len() < 3 {
             return;
         }
         // Evaluate RHS first (so it doesn't see the new binding)
         self.analyze(&forms[2]);
-        // Detect (local name (require :mod)) → record module binding
+
         if let Form::Symbol(name) = &forms[1].node {
+            // Cross-scope shadow check for explicit local/var
+            self.check_outer_shadow(name, &forms[1].span);
+            // Detect (local name (require :mod)) → record module bindings
             if let Some(module) = extract_require_module(&forms[2]) {
-                self.result.module_bindings.insert(name.clone(), module);
+                self.result.module_bindings.insert(name.clone(), module.clone());
+                self.result.require_def_bytes.insert(forms[1].span.start, module);
             }
         }
         self.bind_pattern(&forms[1], kind);
+        // Record table shape for field completions
+        self.set_table_fields(&forms[1], &forms[2]);
     }
 
     // ── (set name val) ────────────────────────────────────────────────────────
@@ -614,7 +682,12 @@ impl Analyzer {
             let mut i = 0;
             while i + 1 < bindings.len() {
                 self.analyze(&bindings[i + 1]);
+                // Cross-scope shadow check for plain symbol let-bindings
+                if let Form::Symbol(name) = &bindings[i].node {
+                    self.check_outer_shadow(name, &bindings[i].span);
+                }
                 self.bind_pattern(&bindings[i], DefKind::Local);
+                self.set_table_fields(&bindings[i], &bindings[i + 1]);
                 i += 2;
             }
         }
@@ -1321,14 +1394,31 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
     let referenced: std::collections::HashSet<u32> =
         analyzer.result.refs.values().copied().collect();
 
+    // Warn on require bindings that are never used.
+    let unused_requires: Vec<(String, String, Span)> = analyzer.result.require_def_bytes.iter()
+        .filter(|(&db, _)| !referenced.contains(&db))
+        .filter_map(|(&db, module)| {
+            analyzer.result.defs.get(&db)
+                .map(|def| (def.name.clone(), module.clone(), def.span.clone()))
+        })
+        .collect();
+    for (name, module, span) in unused_requires {
+        analyzer.result.warnings.push(AnalysisWarning {
+            message: format!("`{}` (require :{}) is required but never used", name, module),
+            span,
+            related_span: None,
+        });
+    }
+
     // Warn on `local` bindings that are never read.
-    // Skips `_`-prefixed names (conventional discard) and destructured bindings
-    // (too noisy when only some fields of a table are used).
+    // Skips `_`-prefixed names (conventional discard), destructured bindings,
+    // and require bindings (those get their own message above).
     let unused_locals: Vec<(String, Span)> = analyzer.result.defs.iter()
         .filter(|(&db, def)| {
             def.kind == DefKind::Local
                 && !referenced.contains(&db)
                 && !def.name.starts_with('_')
+                && !analyzer.result.require_def_bytes.contains_key(&db)
         })
         .map(|(_, def)| (def.name.clone(), def.span.clone()))
         .collect();
@@ -1461,13 +1551,43 @@ mod tests {
     }
 
     #[test]
-    fn parent_scope_shadow_no_warn() {
+    fn same_scope_shadow_still_warns_already_defined() {
+        // Same-scope re-definition keeps the original "already defined" message.
         assert!(!has_warning("(local x 1) (let [] (local x 2) x) x", "already defined"));
     }
 
     #[test]
     fn underscore_no_shadow_warn() {
         assert!(!has_warning("(let [_ 1 _ 2] nil)", "already defined"));
+    }
+
+    // ── Cross-scope shadowing ─────────────────────────────────────────────────
+
+    #[test]
+    fn outer_scope_shadow_warns() {
+        assert!(has_warning("(local x 1) (do (local x 2) x) x", "shadows a binding from an outer scope"));
+    }
+
+    #[test]
+    fn let_binding_outer_shadow_warns() {
+        assert!(has_warning("(local x 1) (let [x 2] x)", "shadows a binding from an outer scope"));
+    }
+
+    #[test]
+    fn fn_param_outer_shadow_no_warn() {
+        // Function params are not checked — too noisy and idiomatic to reuse names.
+        assert!(!has_warning("(local x 1) (fn f [x] x)", "shadows"));
+    }
+
+    #[test]
+    fn loop_var_outer_shadow_no_warn() {
+        // Loop vars (each/for) are also not checked.
+        assert!(!has_warning("(local x 1) (each [x []] x)", "shadows"));
+    }
+
+    #[test]
+    fn underscore_outer_shadow_no_warn() {
+        assert!(!has_warning("(local _ 1) (do (local _ 2) nil)", "shadows"));
     }
 
     #[test]
@@ -2822,5 +2942,85 @@ mod tests {
         let r = analyze_src("(local {:foo foo} (require :mod))");
         // Destructuring: forms[1] is a Table, not a Symbol — no module_bindings entry
         assert!(r.module_bindings.is_empty());
+    }
+
+    // ── Unused require warnings ───────────────────────────────────────────────
+
+    #[test]
+    fn unused_require_warns() {
+        assert!(has_warning(
+            "(local api (require :my-mod))",
+            "required but never used",
+        ));
+    }
+
+    #[test]
+    fn used_require_no_warn() {
+        assert!(!has_warning(
+            "(local api (require :my-mod)) (api.call)",
+            "required but never used",
+        ));
+    }
+
+    #[test]
+    fn used_require_field_access_no_warn() {
+        // api.foo is a reference to the root `api` binding
+        assert!(!has_warning(
+            "(local api (require :mod)) api.foo",
+            "required but never used",
+        ));
+    }
+
+    #[test]
+    fn unused_require_not_double_warned_as_unused_local() {
+        // Unused require should emit the require message, NOT "defined but never used"
+        let ws = warnings_for("(local api (require :mod))");
+        assert!(ws.iter().any(|w| w.contains("required but never used")));
+        assert!(!ws.iter().any(|w| w.contains("defined but never used")));
+    }
+
+    // ── Table field completions ───────────────────────────────────────────────
+
+    #[test]
+    fn table_fields_extracted_from_literal() {
+        let r = analyze_src("(local t {:a 1 :b 2})");
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"a".to_string()), "expected 'a' in fields: {:?}", fields);
+        assert!(fields.contains(&"b".to_string()), "expected 'b' in fields: {:?}", fields);
+    }
+
+    #[test]
+    fn table_fields_string_keys() {
+        let r = analyze_src(r#"(local t {"name" 1 "age" 2})"#);
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"name".to_string()));
+        assert!(fields.contains(&"age".to_string()));
+    }
+
+    #[test]
+    fn table_fields_non_table_rhs_is_none() {
+        let r = analyze_src("(local x 42)");
+        let def = r.defs.values().find(|d| d.name == "x").unwrap();
+        assert!(def.table_fields.is_none());
+    }
+
+    #[test]
+    fn table_fields_let_binding() {
+        let r = analyze_src("(let [t {:x 10 :y 20}] t)");
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"x".to_string()));
+        assert!(fields.contains(&"y".to_string()));
+    }
+
+    #[test]
+    fn table_fields_computed_key_skipped_others_kept() {
+        // Computed keys (non-keyword, non-string) are silently skipped; static ones are kept.
+        let r = analyze_src("(local t {:a 1})");
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"a".to_string()));
     }
 }
