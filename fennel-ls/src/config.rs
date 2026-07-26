@@ -144,6 +144,11 @@ fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config>
 
     lua.globals().set("fennel", fennel.clone())?;
 
+    // Install Fennel's require searcher so (require :some.module) resolves
+    // .fnl files via fennel.path rather than Lua's native .lua-only searcher.
+    let install_fn: LuaFunction = fennel.get("install")?;
+    install_fn.call::<_, ()>(())?;
+
     let eval_fn: LuaFunction = fennel.get("eval")?;
     let opts = lua.create_table()?;
     opts.set("filename", path.to_string_lossy().as_ref())?;
