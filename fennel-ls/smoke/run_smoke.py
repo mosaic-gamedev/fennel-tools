@@ -7,7 +7,7 @@ Starts the LSP binary, opens smoke files, and verifies:
   - textDocument/references (cross-file)
   - textDocument/rename (cross-file)
   - textDocument/formatting  (requires default build; skipped with --no-formatting)
-  - macro expansion diagnostics (requires --features embedded-fennel build)
+  - macro expansion diagnostics
 
 Usage:
   python3 smoke/run_smoke.py [--binary PATH]
@@ -380,7 +380,6 @@ def run(binary):
               f"got: {result2!r}")
 
     # ── macro expansion diagnostics ───────────────────────────────────────────
-    # Requires: binary built with --features embedded-fennel.
     # Verifies that after expansion, macro-introduced names ('defsimple' from
     # scope.macros, 'answer' from scope.unmanglings) do NOT appear as
     # "unknown identifier" diagnostics.
@@ -396,11 +395,7 @@ def run(binary):
 
     diag, satisfied = lsp.wait_for_diagnostics(macro_user_uri, no_unknown_ids, timeout=5.0)
     if not satisfied:
-        # Predicate never became true: either no diagnostics arrived at all, or
-        # the only publish was the pre-expansion one (warnings still present).
-        # Both indicate embedded-fennel is not active — skip rather than fail.
-        print("  SKIP  macro expansion (no clean re-publish within timeout — "
-              "binary built without --features embedded-fennel?)")
+        print("  FAIL  macro expansion (no clean re-publish within timeout)")
     else:
         diagnostics = diag.get("diagnostics", [])
         messages = [d.get("message", "") for d in diagnostics]
@@ -1360,6 +1355,219 @@ def run(binary):
               "name" not in top_level_names,
               f"variableNames at top-level: {top_level_names!r}")
 
+    # ── Lua module require (direct Fennel → Lua) ─────────────────────────────
+    print("\n=== Lua module require ===")
+
+    lua_consumer_path = os.path.join(SMOKE_DIR, "lua-consumer.fnl")
+    lua_consumer_uri  = file_uri(lua_consumer_path)
+    lua_api_path      = os.path.join(SMOKE_DIR, "lua-api.lua")
+    lua_api_uri       = file_uri(lua_api_path)
+    lua_consumer_text = read_file(lua_consumer_path)
+    lua_api_text      = read_file(lua_api_path)
+
+    lsp.notify("textDocument/didOpen", {
+        "textDocument": {
+            "uri": lua_consumer_uri,
+            "languageId": "fennel",
+            "version": 1,
+            "text": lua_consumer_text,
+        }
+    })
+    lsp.request("textDocument/documentSymbol", {"textDocument": {"uri": lua_consumer_uri}})
+
+    # No unknown-identifier warnings for Lua module members
+    lua_diag, satisfied = lsp.wait_for_diagnostics(
+        lua_consumer_uri,
+        lambda p: p is not None,  # any publish is fine; we just need the list
+        timeout=5.0,
+    )
+    if lua_diag is not None:
+        unknown = [
+            d for d in lua_diag.get("diagnostics", [])
+            if "unknown identifier" in d.get("message", "")
+            and any(
+                m in d.get("message", "")
+                for m in ("api.add", "api.greet", "api.answer")
+            )
+        ]
+        check("no unknown-identifier warnings for Lua module members (api.add/greet/answer)",
+              len(unknown) == 0,
+              f"warnings: {[d.get('message') for d in unknown]}")
+    else:
+        print("  SKIP  Lua module diagnostics (no publish within timeout)")
+
+    # Goto-def: cursor on api.add → should navigate into lua-api.lua
+    consumer_lines = lua_consumer_text.splitlines()
+    add_call_line = next(
+        i for i, l in enumerate(consumer_lines) if "api.add" in l and "(api.add" in l
+    )
+    add_call_col = consumer_lines[add_call_line].index("api.add")
+
+    r = lsp.request("textDocument/definition", {
+        "textDocument": {"uri": lua_consumer_uri},
+        "position": {"line": add_call_line, "character": add_call_col},
+    })
+    result = r.get("result")
+    if result is None or (isinstance(result, list) and not result):
+        check("Lua goto-def: api.add returns a result", False, f"got: {result!r}")
+    else:
+        loc = result[0] if isinstance(result, list) else result
+        check("Lua goto-def: api.add targets lua-api.lua",
+              loc.get("uri") == lua_api_uri,
+              f"uri: {loc.get('uri')!r}, expected: {lua_api_uri!r}")
+        # add is defined on the first non-comment, non-blank line in lua-api.lua
+        add_lua_line = next(
+            i for i, l in enumerate(lua_api_text.splitlines())
+            if "function add" in l
+        )
+        def_line = loc.get("range", {}).get("start", {}).get("line")
+        check("Lua goto-def: api.add lands on the correct Lua line",
+              def_line == add_lua_line,
+              f"got line {def_line}, want {add_lua_line}")
+
+    # Goto-def: cursor on api.greet → should also navigate into lua-api.lua
+    greet_call_line = next(
+        i for i, l in enumerate(consumer_lines) if "(api.greet" in l
+    )
+    greet_call_col = consumer_lines[greet_call_line].index("api.greet")
+
+    r = lsp.request("textDocument/definition", {
+        "textDocument": {"uri": lua_consumer_uri},
+        "position": {"line": greet_call_line, "character": greet_call_col},
+    })
+    result = r.get("result")
+    if result is None or (isinstance(result, list) and not result):
+        check("Lua goto-def: api.greet returns a result", False, f"got: {result!r}")
+    else:
+        loc = result[0] if isinstance(result, list) else result
+        check("Lua goto-def: api.greet targets lua-api.lua",
+              loc.get("uri") == lua_api_uri,
+              f"uri: {loc.get('uri')!r}")
+        greet_lua_line = next(
+            i for i, l in enumerate(lua_api_text.splitlines())
+            if "function greet" in l
+        )
+        def_line = loc.get("range", {}).get("start", {}).get("line")
+        check("Lua goto-def: api.greet lands on the correct Lua line",
+              def_line == greet_lua_line,
+              f"got line {def_line}, want {greet_lua_line}")
+
+    # Completion: after "api." should include Lua module members
+    r = lsp.request("textDocument/completion", {
+        "textDocument": {"uri": lua_consumer_uri},
+        "position": {"line": add_call_line, "character": add_call_col + len("api.")},
+    })
+    completion = r.get("result")
+    if completion is None:
+        print("  SKIP  Lua module completion (server returned null)")
+    else:
+        items = completion if isinstance(completion, list) else completion.get("items", [])
+        labels = [it.get("label", "") for it in items]
+        check("Lua module completion includes 'add'",   "add"    in labels, f"labels: {labels}")
+        check("Lua module completion includes 'greet'", "greet"  in labels, f"labels: {labels}")
+        check("Lua module completion includes 'answer'","answer" in labels, f"labels: {labels}")
+
+    # ── Nested require: Fennel → Fennel → Lua ────────────────────────────────
+    print("\n=== Nested require (Fennel → Lua) ===")
+
+    fnl_chain_path  = os.path.join(SMOKE_DIR, "fnl-chain.fnl")
+    fnl_chain_uri   = file_uri(fnl_chain_path)
+    lua_chain_path  = os.path.join(SMOKE_DIR, "lua-chain.lua")
+    lua_chain_uri   = file_uri(lua_chain_path)
+    fnl_chain_text  = read_file(fnl_chain_path)
+    lua_chain_text  = read_file(lua_chain_path)
+
+    lsp.notify("textDocument/didOpen", {
+        "textDocument": {
+            "uri": fnl_chain_uri,
+            "languageId": "fennel",
+            "version": 1,
+            "text": fnl_chain_text,
+        }
+    })
+    lsp.request("textDocument/documentSymbol", {"textDocument": {"uri": fnl_chain_uri}})
+
+    # No unknown-identifier warnings for chain.double / chain.square
+    chain_diag, _ = lsp.wait_for_diagnostics(fnl_chain_uri, lambda p: p is not None, timeout=5.0)
+    if chain_diag is not None:
+        chain_unknown = [
+            d for d in chain_diag.get("diagnostics", [])
+            if "unknown identifier" in d.get("message", "")
+            and any(m in d.get("message", "") for m in ("chain.double", "chain.square"))
+        ]
+        check("nested require: no unknown-identifier warnings for Lua module members",
+              len(chain_unknown) == 0,
+              f"warnings: {[d.get('message') for d in chain_unknown]}")
+    else:
+        print("  SKIP  nested require diagnostics (no publish within timeout)")
+
+    # Goto-def on chain.double → lua-chain.lua at the double function line
+    chain_lines = fnl_chain_text.splitlines()
+    compute_line = next(i for i, l in enumerate(chain_lines) if "chain.double" in l)
+    double_col   = chain_lines[compute_line].index("chain.double")
+
+    r = lsp.request("textDocument/definition", {
+        "textDocument": {"uri": fnl_chain_uri},
+        "position": {"line": compute_line, "character": double_col},
+    })
+    result = r.get("result")
+    if result is None or (isinstance(result, list) and not result):
+        check("nested goto-def: chain.double returns a result", False, f"got: {result!r}")
+    else:
+        loc = result[0] if isinstance(result, list) else result
+        check("nested goto-def: chain.double targets lua-chain.lua",
+              loc.get("uri") == lua_chain_uri,
+              f"uri: {loc.get('uri')!r}, expected: {lua_chain_uri!r}")
+        double_lua_line = next(
+            i for i, l in enumerate(lua_chain_text.splitlines())
+            if "function double" in l
+        )
+        def_line = loc.get("range", {}).get("start", {}).get("line")
+        check("nested goto-def: chain.double lands on the correct Lua line",
+              def_line == double_lua_line,
+              f"got line {def_line}, want {double_lua_line}")
+
+    # Goto-def on chain.square → lua-chain.lua at the square function line
+    square_col = chain_lines[compute_line].index("chain.square")
+
+    r = lsp.request("textDocument/definition", {
+        "textDocument": {"uri": fnl_chain_uri},
+        "position": {"line": compute_line, "character": square_col},
+    })
+    result = r.get("result")
+    if result is None or (isinstance(result, list) and not result):
+        check("nested goto-def: chain.square returns a result", False, f"got: {result!r}")
+    else:
+        loc = result[0] if isinstance(result, list) else result
+        check("nested goto-def: chain.square targets lua-chain.lua",
+              loc.get("uri") == lua_chain_uri,
+              f"uri: {loc.get('uri')!r}")
+        square_lua_line = next(
+            i for i, l in enumerate(lua_chain_text.splitlines())
+            if "function square" in l
+        )
+        def_line = loc.get("range", {}).get("start", {}).get("line")
+        check("nested goto-def: chain.square lands on the correct Lua line",
+              def_line == square_lua_line,
+              f"got line {def_line}, want {square_lua_line}")
+
+    # Goto-def on the require string :lua-chain → navigates into lua-chain.lua
+    require_line = next(i for i, l in enumerate(chain_lines) if ":lua-chain" in l)
+    require_col  = chain_lines[require_line].index(":lua-chain") + 1  # inside the string
+
+    r = lsp.request("textDocument/definition", {
+        "textDocument": {"uri": fnl_chain_uri},
+        "position": {"line": require_line, "character": require_col},
+    })
+    result = r.get("result")
+    if result is not None and not (isinstance(result, list) and not result):
+        loc = result[0] if isinstance(result, list) else result
+        check("nested require string goto-def targets lua-chain.lua",
+              loc.get("uri") == lua_chain_uri,
+              f"uri: {loc.get('uri')!r}")
+    else:
+        print("  SKIP  nested require-string goto-def (no result)")
+
     lsp.close()
     return FAILURES
 
@@ -1371,7 +1579,7 @@ def main():
 
     if not os.path.isfile(args.binary):
         print(f"Binary not found: {args.binary}")
-        print("Run: cargo build --release --features embedded-fennel")
+        print("Run: cargo build --release")
         sys.exit(2)
 
     print(f"Binary: {args.binary}")

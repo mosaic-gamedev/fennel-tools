@@ -35,8 +35,6 @@ pub struct Backend {
     semantic_token_cache: DashMap<String, Vec<u32>>,
     /// Monotonic counter for unique semantic token result IDs.
     token_id_counter: AtomicU64,
-    /// Embedded Fennel macro expander (opt-in via `embedded-fennel` feature).
-    #[cfg(feature = "embedded-fennel")]
     expander: crate::expander::MacroExpander,
 }
 
@@ -51,7 +49,6 @@ impl Backend {
             formatting_enabled,
             semantic_token_cache: DashMap::new(),
             token_id_counter: AtomicU64::new(1),
-            #[cfg(feature = "embedded-fennel")]
             expander: crate::expander::MacroExpander::new(),
         }
     }
@@ -85,11 +82,9 @@ impl Backend {
         *self.global_docs.write().unwrap() = config.global_docs;
     }
 
-    /// If the `embedded-fennel` feature is active, compile `text` with Fennel
-    /// and merge any macro-introduced names into the file's scope, then
-    /// re-publish diagnostics so the false-positive warnings disappear.
+    /// Compile `text` with Fennel and merge any macro-introduced names into
+    /// the file's scope, then re-publish diagnostics.
     async fn run_macro_expansion(&self, uri: Url, text: String) {
-        #[cfg(feature = "embedded-fennel")]
         if text.contains("import-macros") || text.contains("require-macros") {
             let search_path = self.workspace_root
                 .get()
@@ -101,9 +96,6 @@ impl Backend {
                 self.publish_diagnostics(uri).await;
             }
         }
-        // Suppress unused-variable warning when feature is off.
-        #[cfg(not(feature = "embedded-fennel"))]
-        let _ = (uri, text);
     }
 
     fn is_known_global(&self, name: &str) -> bool {
@@ -783,10 +775,9 @@ impl LanguageServer for Backend {
                 let member_root = member.split(['.', ':']).next().unwrap_or(member);
                 if let Some(exports) = file.modules.get(mod_root) {
                     if let Some(def) = exports.defs.get(member_root) {
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: exports.uri.clone(),
-                            range: crate::text::span_to_range(&exports.text, &def.span),
-                        }));
+                        return Some(GotoDefinitionResponse::Scalar(
+                            exports.location_for_def(def),
+                        ));
                     }
                 }
             }

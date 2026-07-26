@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use serde::Deserialize;
+use mlua::prelude::*;
 
 /// Documentation entry for a single global name.
 ///
@@ -48,6 +49,7 @@ pub struct Config {
     /// no hover documentation.  Roots inferred from `global_docs` keys are
     /// added automatically, so you only need this for undocumented globals
     /// (e.g. `known_globals = ["state"]`).
+    #[serde(alias = "known-globals")]
     pub known_globals: Option<Vec<String>>,
 
     /// Paths (relative to the workspace root) of extra TOML files whose
@@ -72,14 +74,22 @@ pub struct Config {
     /// trailing `.member` segments until it finds a match or exhausts the
     /// chain.  This means a single parent namespace entry acts as a fallback
     /// for any child call that has no specific entry.
+    #[serde(alias = "global-docs")]
     pub global_docs: Option<HashMap<String, GlobalDoc>>,
 }
 
 impl Config {
-    /// Load configuration from `<root>/.fennel-ls.toml`.
-    /// Missing file or parse errors return a silent default.
-    /// Include files that are missing or unparseable are silently skipped.
+    /// Load configuration from `<root>/.lsp.fnl` (preferred) or
+    /// `<root>/.fennel-ls.toml` (fallback).
     pub fn load(root: &std::path::Path) -> Self {
+        let fnl_path = root.join(".lsp.fnl");
+        if fnl_path.exists() {
+            match load_fnl(&fnl_path, root) {
+                Ok(config) => return config,
+                Err(e) => log::warn!(".lsp.fnl failed to load: {e}; falling back to .fennel-ls.toml"),
+            }
+        }
+
         let path = root.join(".fennel-ls.toml");
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
@@ -93,10 +103,9 @@ impl Config {
             for rel in &includes {
                 let inc_path = root.join(rel);
                 if let Ok(text) = std::fs::read_to_string(&inc_path) {
-                    if let Ok(inc) = toml::from_str::<IncludeFile>(&text) {
-                        if let Some(docs) = inc.global_docs {
-                            all_docs.extend(docs);
-                        }
+                    match toml::from_str::<IncludeFile>(&text) {
+                        Ok(inc) => { if let Some(docs) = inc.global_docs { all_docs.extend(docs); } }
+                        Err(e) => log::warn!("include file {} failed to parse: {e}", inc_path.display()),
                     }
                 }
             }
@@ -107,6 +116,32 @@ impl Config {
 
         config
     }
+}
+
+const FENNEL_SRC: &str = include_str!("../vendor/fennel.lua");
+
+fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config> {
+    let src = std::fs::read_to_string(path)
+        .map_err(LuaError::external)?;
+
+    let lua = unsafe { Lua::unsafe_new() };
+
+    let fennel: LuaTable = lua.load(FENNEL_SRC).set_name("fennel.lua").eval()?;
+
+    // Extend fennel.path so require works from the project root
+    let root_str = root.to_string_lossy();
+    let orig_path: String = fennel.get("path").unwrap_or_default();
+    fennel.set("path", format!("{}/?.fnl;{}/?/init.fnl;{}", root_str, root_str, orig_path))?;
+
+    lua.globals().set("fennel", fennel.clone())?;
+
+    let eval_fn: LuaFunction = fennel.get("eval")?;
+    let opts = lua.create_table()?;
+    opts.set("filename", path.to_string_lossy().as_ref())?;
+
+    let result: LuaValue = eval_fn.call((src, opts))?;
+
+    lua.from_value(result)
 }
 
 #[cfg(test)]

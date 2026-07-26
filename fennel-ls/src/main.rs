@@ -1,7 +1,7 @@
 mod analyzer;
 mod config;
+mod lua_to_fennel;
 mod docs;
-#[cfg(feature = "embedded-fennel")]
 mod expander;
 mod fmt;
 mod lexer;

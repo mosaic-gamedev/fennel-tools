@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use dashmap::DashMap;
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{Location, Position, Range, Url};
 
 use crate::analyzer::{AnalysisResult, DefinitionInfo};
 use crate::docs::{BuiltinSet, Platform};
@@ -20,14 +20,63 @@ pub struct CrossFileRef {
     pub sym_name: String,
 }
 
+/// Describes the origin of an analyzed module's text.
+#[derive(Debug)]
+pub enum ModuleSource {
+    /// Native Fennel file — spans refer directly to the Fennel source.
+    Fennel,
+    /// Transpiled from a Lua file.
+    ///
+    /// `source_map[i]` gives the Lua source line (1-indexed) for Fennel output
+    /// line `i + 1`. Used to remap definition spans back to their original Lua
+    /// positions when producing LSP Locations.
+    Lua { source_map: Vec<u32> },
+}
+
 /// Top-level exports from a required module file.
 #[derive(Debug)]
 pub struct ModuleExports {
     pub uri: Url,
-    /// Source text of the module (needed for span→range conversion in goto_definition).
+    /// The Fennel text that was analyzed (either native source or transpiled from Lua).
+    /// Byte offsets in `defs` refer to positions within this string.
     pub text: String,
     /// Top-level definitions, keyed by name.
     pub defs: HashMap<String, DefinitionInfo>,
+    /// Where this module's text came from; drives position remapping in `location_for_def`.
+    pub source: ModuleSource,
+}
+
+impl ModuleExports {
+    /// Build an LSP Location pointing to `def` inside this module.
+    ///
+    /// For Fennel modules, byte span → LSP range directly.
+    /// For Lua modules, the byte span is in the generated Fennel; we remap
+    /// via the source map to the original Lua line before returning the Location.
+    pub fn location_for_def(&self, def: &DefinitionInfo) -> Location {
+        match &self.source {
+            ModuleSource::Fennel => Location {
+                uri: self.uri.clone(),
+                range: crate::text::span_to_range(&self.text, &def.span),
+            },
+            ModuleSource::Lua { source_map } => {
+                let fennel_line = newlines_before(&self.text, def.span.start as usize);
+                let lua_line = source_map.get(fennel_line).copied().unwrap_or(1);
+                let lsp_line = lua_line.saturating_sub(1);
+                Location {
+                    uri: self.uri.clone(),
+                    range: Range {
+                        start: Position { line: lsp_line, character: 0 },
+                        end: Position { line: lsp_line, character: 0 },
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Count the number of newlines before `byte` in `text` (= 0-indexed line of that byte).
+fn newlines_before(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].bytes().filter(|&b| b == b'\n').count()
 }
 
 #[derive(Debug)]
@@ -251,18 +300,22 @@ impl Workspace {
 
     /// Load and cache the top-level exports of a module file.
     ///
+    /// Accepts both `.fnl` and `.lua` paths. Lua files are transpiled to Fennel
+    /// before analysis; the resulting source map is stored in `ModuleSource::Lua`
+    /// so that go-to-definition can remap Fennel spans back to Lua line numbers.
+    ///
     /// Priority: open files (live version) > require_cache > disk.
-    /// Reading from disk without a workspace root is intentional — callers
-    /// supply the resolved absolute path.
     pub fn load_module(&self, path: &std::path::Path) -> Option<Arc<ModuleExports>> {
         let uri = Url::from_file_path(path).ok()?;
 
         // Open files take precedence: use the live in-memory version.
+        // Open files are always Fennel (.fnl); Lua files are never tracked as open.
         if let Some(f) = self.files.get(&uri.to_string()) {
             return Some(Arc::new(ModuleExports {
                 uri: f.uri.clone(),
                 text: f.text.clone(),
                 defs: top_level_defs(&f.analysis),
+                source: ModuleSource::Fennel,
             }));
         }
 
@@ -271,15 +324,30 @@ impl Workspace {
             return Some(cached.clone());
         }
 
-        // Read from disk, parse, analyze, cache.
-        let text = std::fs::read_to_string(path).ok()?;
-        let (ast, _) = crate::parser::Parser::parse(&text);
+        // Read from disk.
+        let disk_text = std::fs::read_to_string(path).ok()?;
+
+        // For .lua files: transpile to Fennel first, keeping the source map.
+        let (fennel_text, source) = if path.extension().map_or(false, |e| e == "lua") {
+            match crate::lua_to_fennel::transpile(&disk_text) {
+                Ok(out) => (out.fennel, ModuleSource::Lua { source_map: out.source_map }),
+                Err(e) => {
+                    log::warn!("lua→fennel transpile failed for {}: {e}", path.display());
+                    return None;
+                }
+            }
+        } else {
+            (disk_text, ModuleSource::Fennel)
+        };
+
+        let (ast, _) = crate::parser::Parser::parse(&fennel_text);
         let analysis = crate::analyzer::analyze(&ast);
 
         let exports = Arc::new(ModuleExports {
             uri,
-            text,
+            text: fennel_text,
             defs: top_level_defs(&analysis),
+            source,
         });
         self.require_cache.insert(path.to_path_buf(), exports.clone());
         Some(exports)
@@ -300,14 +368,17 @@ fn top_level_defs(analysis: &AnalysisResult) -> HashMap<String, DefinitionInfo> 
         .collect()
 }
 
-/// Resolve a Fennel module name (e.g. `"my.util"`) to a `.fnl` file path
-/// relative to `root`. Tries `mod/name.fnl` then `mod/name/init.fnl`.
+/// Resolve a Fennel module name (e.g. `"my.util"`) to a source file path
+/// relative to `root`.
+///
+/// Search order: `.fnl` → `init.fnl` → `.lua` → `init.lua`.
+/// Fennel takes priority so that a `.fnl` shadow of a `.lua` file is preferred.
 pub fn resolve_require_path(
     module: &str,
     root: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     let rel = module.replace('.', "/");
-    for suffix in &[".fnl", "/init.fnl"] {
+    for suffix in &[".fnl", "/init.fnl", ".lua", "/init.lua"] {
         let candidate = root.join(format!("{rel}{suffix}"));
         if candidate.exists() {
             return Some(candidate);
@@ -506,6 +577,55 @@ mod tests {
         assert_eq!(module_count, Some(0));
     }
 
+    // ── Lua module loading ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_require_path_lua_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("api.lua"), "").unwrap();
+        let path = resolve_require_path("api", dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("api.lua"));
+    }
+
+    #[test]
+    fn resolve_require_path_fnl_beats_lua() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("api.fnl"), "").unwrap();
+        std::fs::write(dir.path().join("api.lua"), "").unwrap();
+        let path = resolve_require_path("api", dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("api.fnl"), ".fnl should take priority over .lua");
+    }
+
+    #[test]
+    fn load_lua_module_exposes_top_level_defs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("api.lua"),
+            "local function greet(name) return name end",
+        ).unwrap();
+        let ws = Workspace::new();
+        let exports = ws.load_module(&dir.path().join("api.lua")).unwrap();
+        assert!(exports.defs.contains_key("greet"), "greet should be a top-level def");
+        assert!(matches!(exports.source, ModuleSource::Lua { .. }), "source should be Lua");
+    }
+
+    #[test]
+    fn load_lua_module_source_map_points_to_lua_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // line 1: local x = 1
+        // line 2: local function greet(n) return n end
+        std::fs::write(
+            dir.path().join("api.lua"),
+            "local x = 1\nlocal function greet(n) return n end",
+        ).unwrap();
+        let ws = Workspace::new();
+        let exports = ws.load_module(&dir.path().join("api.lua")).unwrap();
+        let def = exports.defs.get("greet").unwrap();
+        let loc = exports.location_for_def(def);
+        // greet is on Lua line 2 (1-indexed) → LSP line 1 (0-indexed)
+        assert_eq!(loc.range.start.line, 1, "goto-def should land on Lua line 2 (LSP line 1)");
+    }
+
     #[test]
     fn update_invalidates_require_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -521,5 +641,174 @@ mod tests {
         let uri = Url::from_file_path(&fnl_path).unwrap();
         ws.update(uri, "(fn new [] nil)".to_string(), 1, None);
         assert!(!ws.require_cache.contains_key(&fnl_path), "cache should be cleared on update");
+    }
+
+    // ── ModuleSource correctness ──────────────────────────────────────────────
+
+    #[test]
+    fn fnl_module_has_fennel_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.fnl"), "(fn foo [] nil)").unwrap();
+        let ws = Workspace::new();
+        let exports = ws.load_module(&dir.path().join("lib.fnl")).unwrap();
+        assert!(matches!(exports.source, ModuleSource::Fennel), "source should be Fennel");
+    }
+
+    #[test]
+    fn lua_module_has_lua_source_with_map() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.lua"), "local function f() end").unwrap();
+        let ws = Workspace::new();
+        let exports = ws.load_module(&dir.path().join("lib.lua")).unwrap();
+        assert!(
+            matches!(exports.source, ModuleSource::Lua { .. }),
+            "source should be Lua with a source map"
+        );
+    }
+
+    #[test]
+    fn location_for_def_fennel_uses_direct_span() {
+        let dir = tempfile::tempdir().unwrap();
+        // `greet` definition starts at a known byte offset — span→range should
+        // point directly to that position without any source-map remapping.
+        std::fs::write(dir.path().join("util.fnl"), "(fn greet [n] n)").unwrap();
+        let ws = Workspace::new();
+        let exports = ws.load_module(&dir.path().join("util.fnl")).unwrap();
+        let def = exports.defs.get("greet").unwrap();
+        let loc = exports.location_for_def(def);
+        // `greet` is the first token after `fn` at col 4 on line 0
+        assert_eq!(loc.range.start.line, 0);
+        assert_eq!(loc.range.start.character, 4, "greet starts at col 4 in '(fn greet [n] n)'");
+    }
+
+    // ── require chain: Fennel file requiring a Lua module ─────────────────────
+
+    #[test]
+    fn update_resolves_lua_require_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("api.lua"),
+            "local function helper(x) return x end",
+        ).unwrap();
+
+        let ws = Workspace::new();
+        let uri = Url::parse("file:///consumer.fnl").unwrap();
+        ws.update(
+            uri.clone(),
+            "(local api (require :api))\n(api.helper 1)".to_string(),
+            1,
+            Some(dir.path()),
+        );
+
+        let module_found = ws.with_file(&uri, |f| f.modules.contains_key("api"));
+        assert_eq!(module_found, Some(true), "api module should be resolved");
+
+        let def_found = ws
+            .with_file(&uri, |f| {
+                f.modules.get("api").map_or(false, |m| m.defs.contains_key("helper"))
+            })
+            .unwrap_or(false);
+        assert!(def_found, "helper should be a def in the resolved Lua module");
+    }
+
+    #[test]
+    fn lua_module_goto_def_remaps_to_lua_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two functions: `f` on line 1, `g` on line 5 (after a blank line).
+        std::fs::write(
+            dir.path().join("lib.lua"),
+            "local function f()\nend\n\n\nlocal function g()\nend",
+        ).unwrap();
+
+        let ws = Workspace::new();
+        let exports = ws.load_module(&dir.path().join("lib.lua")).unwrap();
+
+        let f_loc = exports.location_for_def(exports.defs.get("f").unwrap());
+        let g_loc = exports.location_for_def(exports.defs.get("g").unwrap());
+
+        assert_eq!(f_loc.range.start.line, 0, "f is on Lua line 1 → LSP line 0");
+        assert_eq!(g_loc.range.start.line, 4, "g is on Lua line 5 → LSP line 4");
+    }
+
+    #[test]
+    fn lua_module_cached_as_lua_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cached.lua");
+        std::fs::write(&path, "local function x() end").unwrap();
+
+        let ws = Workspace::new();
+        let e1 = ws.load_module(&path).unwrap();
+        let e2 = ws.load_module(&path).unwrap();
+
+        assert!(Arc::ptr_eq(&e1, &e2), "second load should return the cached Arc");
+        assert!(matches!(e2.source, ModuleSource::Lua { .. }));
+    }
+
+    #[test]
+    fn all_defs_includes_lua_module_defs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mylib.lua");
+        std::fs::write(&path, "local function exported_fn() end").unwrap();
+
+        let ws = Workspace::new();
+        // Populate the require cache
+        ws.load_module(&path).unwrap();
+
+        let defs = ws.all_defs("exported_fn");
+        assert!(!defs.is_empty(), "all_defs should find Lua module defs in the require cache");
+        assert!(defs.iter().any(|(_, _, d)| d.name == "exported_fn"));
+    }
+
+    // ── nested require: Fennel → Fennel → Lua ────────────────────────────────
+
+    #[test]
+    fn nested_require_fnl_then_lua() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // lua-lib.lua: the Lua leaf module
+        std::fs::write(
+            dir.path().join("lua-lib.lua"),
+            "local function compute(x) return x * 2 end",
+        ).unwrap();
+
+        // middle.fnl: Fennel wrapper that requires lua-lib
+        std::fs::write(
+            dir.path().join("middle.fnl"),
+            "(local lib (require :lua-lib))\n(fn wrap [x] (lib.compute x))",
+        ).unwrap();
+
+        let ws = Workspace::new();
+
+        // Open middle.fnl — it should resolve lua-lib as a Lua module
+        let middle_uri = Url::parse("file:///middle.fnl").unwrap();
+        ws.update(
+            middle_uri.clone(),
+            std::fs::read_to_string(dir.path().join("middle.fnl")).unwrap(),
+            1,
+            Some(dir.path()),
+        );
+
+        let lua_module_resolved = ws
+            .with_file(&middle_uri, |f| {
+                f.modules.get("lib").map_or(false, |m| matches!(m.source, ModuleSource::Lua { .. }))
+            })
+            .unwrap_or(false);
+        assert!(lua_module_resolved, "middle.fnl should resolve lua-lib.lua as a Lua module");
+
+        // The Lua module's `compute` def should be reachable for goto-def
+        let compute_found = ws
+            .with_file(&middle_uri, |f| {
+                f.modules.get("lib").map_or(false, |m| m.defs.contains_key("compute"))
+            })
+            .unwrap_or(false);
+        assert!(compute_found, "compute should be findable in lib module");
+
+        // goto-def on lib.compute should remap to Lua line 1 (LSP line 0)
+        let lua_line = ws.with_file(&middle_uri, |f| {
+            let lib = f.modules.get("lib")?;
+            let def = lib.defs.get("compute")?;
+            Some(lib.location_for_def(def).range.start.line)
+        });
+        assert_eq!(lua_line, Some(Some(0)), "compute is on Lua line 1 → LSP line 0");
     }
 }

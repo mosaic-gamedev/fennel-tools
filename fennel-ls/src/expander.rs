@@ -1,10 +1,7 @@
 /// Macro expander: compiles Fennel source in a background thread using an
-/// embedded LuaJIT + Fennel runtime and returns the set of names that the
+/// embedded Lua + Fennel runtime and returns the set of names that the
 /// expanded top-level forms introduce into scope.
-///
-/// Enabled by the `embedded-fennel` Cargo feature.
 
-#[cfg(feature = "embedded-fennel")]
 mod inner {
     use mlua::prelude::*;
     use std::collections::HashSet;
@@ -271,12 +268,11 @@ let lua = unsafe { Lua::unsafe_new() };
     }
 }
 
-#[cfg(feature = "embedded-fennel")]
 pub use inner::MacroExpander;
 
 // ── Integration tests (go through the channel) ───────────────────────────────
 
-#[cfg(all(test, feature = "embedded-fennel"))]
+#[cfg(test)]
 mod tests {
     use super::MacroExpander;
 

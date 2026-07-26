@@ -1348,6 +1348,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
                 && !referenced.contains(&db)
                 && !def.name.starts_with('_')
                 && !def.name.starts_with('<')
+                && !def.name.starts_with('$')
         })
         .map(|(_, def)| (def.name.clone(), def.span.clone()))
         .collect();
@@ -1428,6 +1429,13 @@ mod tests {
     #[test]
     fn fn_param_no_unused_var_warn() {
         assert!(!has_warning("(fn f [x] x)", "never mutated"));
+    }
+
+    #[test]
+    fn hashfn_unused_dollar_params_no_warn() {
+        // $2..$9 are pre-declared for every hashfn but unused ones must not warn
+        assert!(!has_warning("#(+ $ 1)", "unused"));
+        assert!(!has_warning("#(+ $1 $2)", "unused"));
     }
 
     #[test]

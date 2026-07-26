@@ -9,10 +9,16 @@ name = "fennel-ls"
 path = "src/main.rs"
 
 [features]
-embedded-fennel = ["dep:mlua"]
+default = ["luajit"]
+luajit = ["mlua/luajit"]
+lua54 = ["mlua/lua54"]
+lua53 = ["mlua/lua53"]
+lua52 = ["mlua/lua52"]
+lua51 = ["mlua/lua51"]
 
 [dependencies]
-mlua = { version = "0.9", features = ["luajit", "vendored"], optional = true }
+mlua = { version = "0.9", features = ["vendored", "serialize"] }
+full_moon = "2"
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
