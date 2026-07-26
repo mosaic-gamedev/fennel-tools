@@ -1,127 +1,50 @@
-/// User configuration loaded from `.fennel-ls.toml` in the workspace root.
-///
-/// # Quick reference
-///
-/// ```toml
-/// platform = "luajit"
-/// known_globals = ["state"]
-/// include = ["path/to/my-api.toml"]
-///
-/// [global_docs."MyLib.do_thing"]
-/// signature = "(MyLib.do_thing arg1 arg2)"
-/// doc = "Does the thing."
-/// ```
-///
-/// See the **Configuration** section of ARCHITECTURE.md for full details.
-
 use std::collections::HashMap;
 use serde::Deserialize;
 use mlua::prelude::*;
 
-/// Documentation entry for a single global name.
-///
-/// Used in `[global_docs]` sections — either inline in `.fennel-ls.toml`
-/// or in an included file. Both fields mirror the layout used for built-in
-/// docs so hover output is consistent.
+/// Documentation entry for a single global name, loaded from `.lsp.fnl`.
 #[derive(Debug, Default, Deserialize)]
 pub struct GlobalDoc {
-    /// Short fennel-style call signature shown in the hover code block.
-    /// Example: `"(MyLib.module.fn arg1 arg2)"`
     pub signature: String,
-    /// Prose description shown below the signature. Supports Markdown.
     pub doc: Option<String>,
 }
 
-/// Parsed contents of an include file (a TOML file that only contributes
-/// `[global_docs]` entries and nothing else).
-#[derive(Debug, Default, Deserialize)]
-struct IncludeFile {
-    global_docs: Option<HashMap<String, GlobalDoc>>,
-}
-
-/// Full user configuration.
+/// Full user configuration, loaded from `.lsp.fnl` in the workspace root.
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     /// Target Lua platform: "lua51", "lua52", "lua53", "lua54" (default), "luajit", "luau"
     pub platform: Option<String>,
 
-    /// Extra global names that suppress unknown-identifier warnings but have
-    /// no hover documentation.  Roots inferred from `global_docs` keys are
-    /// added automatically, so you only need this for undocumented globals
-    /// (e.g. `known_globals = ["state"]`).
+    /// Extra global names that suppress unknown-identifier warnings but have no hover docs.
+    /// Roots inferred from `global_docs` keys are added automatically.
     #[serde(alias = "known-globals")]
     pub known_globals: Option<Vec<String>>,
 
-    /// Paths (relative to the workspace root) of extra TOML files whose
-    /// `[global_docs]` sections are merged into this config.
-    /// Useful for keeping engine/framework API docs in one shared file and
-    /// referencing them from multiple per-project `.fennel-ls.toml` files.
-    ///
-    /// Example:
-    /// ```toml
-    /// include = ["../../my-engine/api-docs.toml"]
-    /// ```
-    pub include: Option<Vec<String>>,
-
-    /// Inline documentation for global names (functions, namespaces, values).
-    /// Keys are the exact Fennel symbol as it appears in source, including
-    /// dots for namespaced APIs (e.g. `"MyLib.module.fn"`).
-    ///
-    /// Roots are extracted automatically and added to the known-globals set,
-    /// so you do not need to repeat them in `known_globals`.
-    ///
-    /// Hover: the server does an exact-match lookup first, then strips
-    /// trailing `.member` segments until it finds a match or exhausts the
-    /// chain.  This means a single parent namespace entry acts as a fallback
-    /// for any child call that has no specific entry.
+    /// Per-symbol hover documentation. Keys are exact Fennel symbols (dots for namespaces).
     #[serde(alias = "global-docs")]
     pub global_docs: Option<HashMap<String, GlobalDoc>>,
 }
 
 impl Config {
-    /// Load configuration from `<root>/.lsp.fnl` (preferred) or
-    /// `<root>/.fennel-ls.toml` (fallback).
+    /// Load configuration from `<root>/.lsp.fnl`. Returns default if absent or on error.
     pub fn load(root: &std::path::Path) -> Self {
         let fnl_path = root.join(".lsp.fnl");
         log::info!("Config::load: checking for {}", fnl_path.display());
-        if fnl_path.exists() {
-            log::info!("Config::load: found .lsp.fnl, evaluating...");
-            match load_fnl(&fnl_path, root) {
-                Ok(config) => {
-                    log::info!("Config::load: .lsp.fnl loaded successfully");
-                    return config;
-                }
-                Err(e) => log::warn!("Config::load: .lsp.fnl failed to load: {e}; falling back to .fennel-ls.toml"),
-            }
-        } else {
+        if !fnl_path.exists() {
             log::info!("Config::load: .lsp.fnl not found");
+            return Self::default();
         }
-
-        let path = root.join(".fennel-ls.toml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => return Self::default(),
-        };
-        let mut config: Config = toml::from_str(&text).unwrap_or_default();
-
-        // Merge included doc files into global_docs
-        if let Some(includes) = config.include.take() {
-            let mut all_docs = config.global_docs.take().unwrap_or_default();
-            for rel in &includes {
-                let inc_path = root.join(rel);
-                if let Ok(text) = std::fs::read_to_string(&inc_path) {
-                    match toml::from_str::<IncludeFile>(&text) {
-                        Ok(inc) => { if let Some(docs) = inc.global_docs { all_docs.extend(docs); } }
-                        Err(e) => log::warn!("include file {} failed to parse: {e}", inc_path.display()),
-                    }
-                }
+        log::info!("Config::load: found .lsp.fnl, evaluating...");
+        match load_fnl(&fnl_path, root) {
+            Ok(config) => {
+                log::info!("Config::load: .lsp.fnl loaded successfully");
+                config
             }
-            if !all_docs.is_empty() {
-                config.global_docs = Some(all_docs);
+            Err(e) => {
+                log::warn!("Config::load: .lsp.fnl failed to load: {e}");
+                Self::default()
             }
         }
-
-        config
     }
 }
 
@@ -170,29 +93,43 @@ fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config>
 mod tests {
     use super::*;
 
-    fn parse(s: &str) -> Config {
-        toml::from_str(s).unwrap()
+    fn write_lsp_fnl(dir: &std::path::Path, src: &str) {
+        std::fs::write(dir.join(".lsp.fnl"), src).unwrap();
     }
 
     #[test]
-    fn empty_config_is_all_none() {
-        let c = parse("");
-        assert!(c.platform.is_none());
-        assert!(c.known_globals.is_none());
-        assert!(c.include.is_none());
-        assert!(c.global_docs.is_none());
+    fn missing_config_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(dir.path());
+        assert!(config.platform.is_none());
+        assert!(config.known_globals.is_none());
+        assert!(config.global_docs.is_none());
+    }
+
+    #[test]
+    fn empty_table_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), "{}");
+        let config = Config::load(dir.path());
+        assert!(config.platform.is_none());
+        assert!(config.known_globals.is_none());
+        assert!(config.global_docs.is_none());
     }
 
     #[test]
     fn platform_field_parsed() {
-        let c = parse(r#"platform = "luajit""#);
-        assert_eq!(c.platform.as_deref(), Some("luajit"));
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), r#"{:platform "luajit"}"#);
+        let config = Config::load(dir.path());
+        assert_eq!(config.platform.as_deref(), Some("luajit"));
     }
 
     #[test]
     fn known_globals_parsed() {
-        let c = parse(r#"known_globals = ["love", "vim", "hs"]"#);
-        let g = c.known_globals.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), r#"{:known-globals ["love" "vim" "hs"]}"#);
+        let config = Config::load(dir.path());
+        let g = config.known_globals.unwrap();
         assert!(g.contains(&"love".to_string()));
         assert!(g.contains(&"vim".to_string()));
         assert!(g.contains(&"hs".to_string()));
@@ -200,35 +137,30 @@ mod tests {
 
     #[test]
     fn platform_and_globals_together() {
-        let c = parse(r#"
-platform = "lua51"
-known_globals = ["my_lib"]
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), r#"{:platform "lua51" :known-globals ["my_lib"]}"#);
+        let config = Config::load(dir.path());
+        assert_eq!(config.platform.as_deref(), Some("lua51"));
+        assert_eq!(config.known_globals.unwrap(), vec!["my_lib"]);
+    }
+
+    #[test]
+    fn invalid_fennel_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), "this is not valid fennel {{{{");
+        let config = Config::load(dir.path());
+        assert!(config.platform.is_none());
+    }
+
+    #[test]
+    fn global_docs_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), r#"
+{:global-docs {"MyLib.module.fn" {:signature "(MyLib.module.fn cols rows)"
+                                   :doc "Does something."}}}
 "#);
-        assert_eq!(c.platform.as_deref(), Some("lua51"));
-        assert_eq!(c.known_globals.unwrap(), vec!["my_lib"]);
-    }
-
-    #[test]
-    fn invalid_toml_returns_default() {
-        let c: Config = toml::from_str("not valid {{{{").unwrap_or_default();
-        assert!(c.platform.is_none());
-    }
-
-    #[test]
-    fn include_field_parsed() {
-        let c = parse(r#"include = ["../../my-api.toml", "extra.toml"]"#);
-        let inc = c.include.unwrap();
-        assert_eq!(inc, vec!["../../my-api.toml", "extra.toml"]);
-    }
-
-    #[test]
-    fn global_docs_inline_parsed() {
-        let c = parse(r#"
-[global_docs."MyLib.module.fn"]
-signature = "(MyLib.module.fn cols rows)"
-doc = "Does something."
-"#);
-        let docs = c.global_docs.unwrap();
+        let config = Config::load(dir.path());
+        let docs = config.global_docs.unwrap();
         let entry = docs.get("MyLib.module.fn").unwrap();
         assert_eq!(entry.signature, "(MyLib.module.fn cols rows)");
         assert_eq!(entry.doc.as_deref(), Some("Does something."));
@@ -236,77 +168,30 @@ doc = "Does something."
 
     #[test]
     fn global_docs_doc_field_is_optional() {
-        let c = parse(r#"
-[global_docs."MyLib.fn"]
-signature = "(MyLib.fn x)"
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), r#"
+{:global-docs {"MyLib.fn" {:signature "(MyLib.fn x)"}}}
 "#);
-        let docs = c.global_docs.unwrap();
+        let config = Config::load(dir.path());
+        let docs = config.global_docs.unwrap();
         let entry = docs.get("MyLib.fn").unwrap();
         assert!(entry.doc.is_none());
     }
 
     #[test]
-    fn global_docs_merge_from_include_file() {
-        use std::io::Write;
+    fn require_merges_docs_from_another_file() {
         let dir = tempfile::tempdir().unwrap();
-
-        // Write the included file
-        let inc_path = dir.path().join("api.toml");
-        let mut f = std::fs::File::create(&inc_path).unwrap();
-        writeln!(f, r#"
-[global_docs."Engine.tick"]
-signature = "(Engine.tick dt)"
-doc = "Called every frame."
+        std::fs::write(dir.path().join("api.fnl"), r#"
+{"Engine.tick" {:signature "(Engine.tick dt)" :doc "Called every frame."}}
 "#).unwrap();
-
-        // Write the base config
-        let base_path = dir.path().join(".fennel-ls.toml");
-        let mut f = std::fs::File::create(&base_path).unwrap();
-        writeln!(f, r#"include = ["api.toml"]"#).unwrap();
-
+        write_lsp_fnl(dir.path(), r#"
+(local api (require :api))
+{:global-docs api}
+"#);
         let config = Config::load(dir.path());
         let docs = config.global_docs.unwrap();
         let entry = docs.get("Engine.tick").unwrap();
         assert_eq!(entry.signature, "(Engine.tick dt)");
         assert_eq!(entry.doc.as_deref(), Some("Called every frame."));
-    }
-
-    #[test]
-    fn include_missing_file_is_silently_skipped() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let base_path = dir.path().join(".fennel-ls.toml");
-        let mut f = std::fs::File::create(&base_path).unwrap();
-        writeln!(f, r#"include = ["does-not-exist.toml"]"#).unwrap();
-        // Should not panic; global_docs stays empty
-        let config = Config::load(dir.path());
-        assert!(config.global_docs.is_none());
-    }
-
-    #[test]
-    fn inline_and_included_docs_are_merged() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-
-        let inc_path = dir.path().join("extra.toml");
-        let mut f = std::fs::File::create(&inc_path).unwrap();
-        writeln!(f, r#"
-[global_docs."Lib.from_include"]
-signature = "(Lib.from_include)"
-"#).unwrap();
-
-        let base_path = dir.path().join(".fennel-ls.toml");
-        let mut f = std::fs::File::create(&base_path).unwrap();
-        writeln!(f, r#"
-include = ["extra.toml"]
-
-[global_docs."Lib.inline"]
-signature = "(Lib.inline)"
-"#).unwrap();
-
-        let config = Config::load(dir.path());
-        let docs = config.global_docs.unwrap();
-        assert!(docs.contains_key("Lib.from_include"), "missing include entry");
-        assert!(docs.contains_key("Lib.inline"), "missing inline entry");
     }
 }

@@ -61,7 +61,7 @@ Status legend: **✅ done** · **❌ not implemented** · **N/A not applicable**
 | Hover on local/fn definitions | ✅ | Shows signature and inline docstring |
 | Hover on builtin specials | ✅ | Fennel built-in docs embedded |
 | Hover on Lua builtins | ✅ | Platform-specific (LuaJIT / Lua 5.x) |
-| Hover on globals from config | ✅ | Reads `global_docs` from `.fennel-ls.toml` |
+| Hover on globals from config | ✅ | Reads `global_docs` from `.lsp.fnl` |
 | Hover on cross-file symbols | ✅ | Follows require chain |
 | Markdown content format | ✅ | Code fences + docstring prose |
 
@@ -228,7 +228,7 @@ Status legend: **✅ done** · **❌ not implemented** · **N/A not applicable**
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `workspace/didChangeConfiguration` | ✅ | Re-reads `.fennel-ls.toml`; re-publishes diagnostics |
+| `workspace/didChangeConfiguration` | ✅ | Re-reads `.lsp.fnl`; re-publishes diagnostics |
 | `workspace/symbol` | ✅ | |
 | `workspace/didChangeWatchedFiles` | ✅ | Reloads required-but-not-open files changed on disk |
 | `workspace/didCreateFiles` | ✅ | Invalidates require cache; indexes new file |

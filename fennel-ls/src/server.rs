@@ -22,10 +22,10 @@ pub struct Backend {
     pub client: Client,
     pub workspace: Workspace,
     workspace_root: OnceLock<std::path::PathBuf>,
-    /// Extra globals from `.fennel-ls.toml` that suppress unknown-identifier warnings.
+    /// Extra globals from `.lsp.fnl` that suppress unknown-identifier warnings.
     /// Populated from `known_globals` plus roots inferred from `global_docs` keys.
     extra_globals: RwLock<Option<HashSet<String>>>,
-    /// Per-symbol hover docs loaded from `global_docs` (inline or via `include`).
+    /// Per-symbol hover docs loaded from `global_docs` in `.lsp.fnl`.
     /// Keys are exact Fennel symbol names, e.g. `"MyLib.module.fn"`.
     global_docs: RwLock<Option<HashMap<String, GlobalDoc>>>,
     /// Whether `textDocument/formatting` is enabled (disabled via `--no-formatting`).
@@ -53,7 +53,7 @@ impl Backend {
         }
     }
 
-    /// Re-read `.fennel-ls.toml` from `root` and apply the configuration.
+    /// Re-read `.lsp.fnl` from `root` and apply the configuration.
     /// Safe to call at any time — uses interior mutability (RwLock).
     fn apply_config(&self, root: &std::path::Path) {
         log::info!("apply_config: loading config from {}", root.display());
@@ -738,7 +738,7 @@ impl LanguageServer for Backend {
                 });
             }
 
-            // Custom global docs from `.fennel-ls.toml` / included files.
+            // Custom global docs from `.lsp.fnl`.
             // Try the full name first, then progressively strip trailing
             // members until a match is found or the chain is exhausted.
             // This lets a parent namespace entry serve as a fallback for

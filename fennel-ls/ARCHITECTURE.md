@@ -73,39 +73,42 @@ Text sync mode: **INCREMENTAL** — the client sends only changed ranges; each
 `TextDocumentContentChangeEvent` is applied in sequence to the in-memory text,
 then the pipeline re-runs on the full (now-updated) text.
 
-**Configuration:** on `initialize`, the server reads `.fennel-ls.toml` from
+**Configuration:** on `initialize`, the server evaluates `.lsp.fnl` from
 the workspace root (if present). See the **Configuration** section below.
 
 ---
 
 ## Configuration
 
-The server looks for `.fennel-ls.toml` in the workspace root on startup.
-All fields are optional; an empty file or a missing file is valid.
+The server looks for `.lsp.fnl` in the workspace root on startup and evaluates
+it as a Fennel file using the bundled Fennel runtime.  The file must return a
+table; a missing file or an empty table `{}` both produce default behaviour.
 
 ### Fields
 
 | Field | Type | Description |
 |---|---|---|
-| `platform` | string | Lua platform for built-in docs: `"lua51"`, `"lua52"`, `"lua53"`, `"lua54"` (default), `"luajit"`, `"luau"`. |
-| `known_globals` | string array | Global names that suppress unknown-identifier warnings but have no hover documentation. Roots derived from `global_docs` keys are added automatically, so only list globals with no associated docs here (e.g. engine-injected tables like `state`). |
-| `include` | string array | Paths (relative to the workspace root) of extra TOML files whose `[global_docs]` sections are merged into this config. Use this to keep engine/framework API docs in one shared file and reference them from many per-project configs. |
-| `global_docs` | table | Per-symbol hover documentation. See below. |
+| `:platform` | string | Lua platform for built-in docs: `"lua51"`, `"lua52"`, `"lua53"`, `"lua54"` (default), `"luajit"`, `"luau"`. |
+| `:known-globals` | string array | Global names that suppress unknown-identifier warnings but have no hover documentation. Roots derived from `:global-docs` keys are added automatically, so only list globals with no associated docs here (e.g. engine-injected tables like `state`). |
+| `:global-docs` | table | Per-symbol hover documentation. See below. |
 
-### `global_docs`
+Both kebab-case (`:known-globals`, `:global-docs`) and snake_case
+(`:known_globals`, `:global_docs`) keys are accepted.
+
+### `:global-docs`
 
 Each key is the exact Fennel symbol as it appears in source code, including
-dots for namespaced APIs.  Each value has two sub-fields:
+dots for namespaced APIs.  Each value is a table with two fields:
 
-| Sub-field | Required | Description |
+| Field | Required | Description |
 |---|---|---|
-| `signature` | yes | Short Fennel-style call form shown in the hover code block. |
-| `doc` | no | Prose description shown below the signature. Supports Markdown. |
+| `:signature` | yes | Short Fennel-style call form shown in the hover code block. |
+| `:doc` | no | Prose description shown below the signature. Supports Markdown. |
 
 **Root inference:** the server automatically extracts the root of every
-`global_docs` key (everything before the first `.` or `:`) and adds it to the
-known-globals set.  You do not need to list `Mosaic` in `known_globals` just
-because you have `global_docs."Mosaic.Grid.set_tile"`.
+`:global-docs` key (everything before the first `.` or `:`) and adds it to the
+known-globals set.  You do not need to list `Mosaic` in `:known-globals` just
+because you have a `"Mosaic.Grid.set_tile"` entry.
 
 **Hover fallback:** on hover the server tries the full symbol name first
 (e.g. `Mosaic.Grid.set_tile`), then strips the last member and retries
@@ -115,40 +118,58 @@ fallback doc for any undocumented member of that namespace.
 
 ### Minimal example
 
-```toml
-platform = "luajit"
-known_globals = ["state"]          # persistent game-state table, no docs needed
-include = ["../../engine/api.toml"] # engine API docs live in the engine repo
+```fennel
+;; .lsp.fnl
+{:platform "luajit"
+ :known-globals ["state"]}   ; persistent game-state table, no docs needed
+```
+
+### Inline global docs
+
+```fennel
+;; .lsp.fnl
+{:platform "luajit"
+ :known-globals ["state"]
+ :global-docs
+ {"Mosaic.Grid.set_tile"
+  {:signature "(Mosaic.Grid.set_tile col row index primary secondary rotation)"
+   :doc "Draw a tile on the grid.\n- `primary` / `secondary` — `{r g b a}` colour tables (values 0–1).\n- `rotation` — radians clockwise around the tile centre (default `0`)."}
+
+  "Mosaic.Input.cursor_cell"
+  {:signature "(Mosaic.Input.cursor_cell)"
+   :doc "Returns `{col row}` of the cell under the cursor, or `nil` if outside the grid."}}}
 ```
 
 ### Splitting docs into a shared file
 
-Put the `[global_docs]` table in a separate TOML file (e.g. `mosaic.toml`)
-alongside the engine source, then reference it from each project's
-`.fennel-ls.toml`.  The included file may only contain a `[global_docs]`
-section; all other fields are ignored.
+Because `.lsp.fnl` is evaluated Fennel, you can `require` other `.fnl` files
+and merge their tables.  This is the idiomatic way to keep engine API docs
+alongside the engine source and reference them from per-project configs.
 
-**`engine/mosaic.toml`:**
-```toml
-[global_docs."Mosaic.Grid.set_tile"]
-signature = "(Mosaic.Grid.set_tile col row index primary secondary rotation)"
-doc = """
-Draw a tile on the grid.
-- `primary` / `secondary` — `{r g b a}` colour tables (values 0–1).
-- `rotation` — radians clockwise around the tile centre (default `0`).
-"""
+**`engine/mosaic-api.fnl`** (returns the `:global-docs` table directly):
+```fennel
+{"Mosaic.Grid.set_tile"
+ {:signature "(Mosaic.Grid.set_tile col row index primary secondary rotation)"
+  :doc "Draw a tile on the grid."}
 
-[global_docs."Mosaic.Input.cursor_cell"]
-signature = "(Mosaic.Input.cursor_cell)"
-doc = "Returns `{col row}` of the cell under the cursor, or `nil` if the cursor is outside the grid."
+ "Mosaic.Input.cursor_cell"
+ {:signature "(Mosaic.Input.cursor_cell)"
+  :doc "Returns `{col row}` of the cell under the cursor."}}
 ```
 
-**`my-game/.fennel-ls.toml`:**
-```toml
-platform = "luajit"
-known_globals = ["state"]
-include = ["../engine/mosaic.toml"]
+**`my-game/.lsp.fnl`**:
+```fennel
+(local mosaic (require :mosaic-api))   ; resolved via fennel.path from workspace root
+
+{:platform "luajit"
+ :known-globals ["state"]
+ :global-docs mosaic}
 ```
+
+`require` resolves `.fnl` files relative to the workspace root using Fennel's
+standard `?.fnl` and `?/init.fnl` search patterns, so the module path above
+matches `<workspace-root>/mosaic-api.fnl`.  For files outside the workspace
+root you can use `dofile` with an absolute path instead.
 
 ---
 
@@ -551,8 +572,7 @@ and emits indented text:
 
 Wire the formatter into `textDocument/formatting` and
 `textDocument/rangeFormatting`. Configuration options (indent width, column
-limit) can be passed via `FormattingOptions` or a `.fennel-ls.toml` file in
-the workspace root.
+limit) can be passed via `FormattingOptions` or `.lsp.fnl` in the workspace root.
 
 ---
 
@@ -694,7 +714,7 @@ src/server.rs   — 44 unit tests (format_definition, def_kind_to_symbol_kind,
 
 src/text.rs     — 15 unit tests
 
-src/config.rs   — 5 unit tests (TOML parsing, defaults, error handling)
+src/config.rs   — 8 unit tests (.lsp.fnl parsing, require integration, defaults, error handling)
 
 tree-sitter-fennel/test/corpus/
   edge-cases.txt  — comma-as-separator, unquote_splice in sequence, multiple
