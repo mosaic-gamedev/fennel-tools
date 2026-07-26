@@ -56,7 +56,15 @@ impl Backend {
     /// Re-read `.fennel-ls.toml` from `root` and apply the configuration.
     /// Safe to call at any time — uses interior mutability (RwLock).
     fn apply_config(&self, root: &std::path::Path) {
+        log::info!("apply_config: loading config from {}", root.display());
         let config = crate::config::Config::load(root);
+
+        log::info!(
+            "apply_config: platform={:?} known_globals={:?} global_docs={} entries",
+            config.platform,
+            config.known_globals,
+            config.global_docs.as_ref().map_or(0, |d| d.len()),
+        );
 
         let platform = config.platform.as_deref().and_then(platform_from_str);
         if let Some(p) = platform {
@@ -74,6 +82,7 @@ impl Backend {
                 }
             }
         }
+        log::info!("apply_config: extra_globals = {:?}", all_globals);
         *self.extra_globals.write().unwrap() = if all_globals.is_empty() {
             None
         } else {
@@ -176,6 +185,11 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Store workspace root for require resolution and config loading
+        log::info!(
+            "initialize: rootUri={:?} workspaceFolders={:?}",
+            params.root_uri,
+            params.workspace_folders.as_ref().map(|fs| fs.iter().map(|f| f.uri.as_str()).collect::<Vec<_>>()),
+        );
         let root = params.root_uri
             .as_ref()
             .and_then(|u| u.to_file_path().ok())
@@ -185,8 +199,11 @@ impl LanguageServer for Backend {
                     .and_then(|f| f.uri.to_file_path().ok())
             });
         if let Some(path) = root {
+            log::info!("initialize: resolved workspace root → {}", path.display());
             self.apply_config(&path);
             let _ = self.workspace_root.set(path);
+        } else {
+            log::warn!("initialize: no workspace root could be resolved — config will not be loaded");
         }
 
         Ok(InitializeResult {

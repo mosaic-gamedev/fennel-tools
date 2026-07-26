@@ -83,11 +83,18 @@ impl Config {
     /// `<root>/.fennel-ls.toml` (fallback).
     pub fn load(root: &std::path::Path) -> Self {
         let fnl_path = root.join(".lsp.fnl");
+        log::info!("Config::load: checking for {}", fnl_path.display());
         if fnl_path.exists() {
+            log::info!("Config::load: found .lsp.fnl, evaluating...");
             match load_fnl(&fnl_path, root) {
-                Ok(config) => return config,
-                Err(e) => log::warn!(".lsp.fnl failed to load: {e}; falling back to .fennel-ls.toml"),
+                Ok(config) => {
+                    log::info!("Config::load: .lsp.fnl loaded successfully");
+                    return config;
+                }
+                Err(e) => log::warn!("Config::load: .lsp.fnl failed to load: {e}; falling back to .fennel-ls.toml"),
             }
+        } else {
+            log::info!("Config::load: .lsp.fnl not found");
         }
 
         let path = root.join(".fennel-ls.toml");
@@ -131,7 +138,9 @@ fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config>
     // Extend fennel.path so require works from the project root
     let root_str = root.to_string_lossy();
     let orig_path: String = fennel.get("path").unwrap_or_default();
-    fennel.set("path", format!("{}/?.fnl;{}/?/init.fnl;{}", root_str, root_str, orig_path))?;
+    let new_path = format!("{}/?.fnl;{}/?/init.fnl;{}", root_str, root_str, orig_path);
+    log::debug!("load_fnl: fennel.path = {}", new_path);
+    fennel.set("path", new_path)?;
 
     lua.globals().set("fennel", fennel.clone())?;
 
@@ -139,9 +148,17 @@ fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config>
     let opts = lua.create_table()?;
     opts.set("filename", path.to_string_lossy().as_ref())?;
 
-    let result: LuaValue = eval_fn.call((src, opts))?;
+    log::debug!("load_fnl: calling fennel.eval on {}", path.display());
+    let result: LuaValue = eval_fn.call((src, opts)).map_err(|e| {
+        log::warn!("load_fnl: fennel.eval failed: {e}");
+        e
+    })?;
 
-    lua.from_value(result)
+    log::debug!("load_fnl: deserializing result");
+    lua.from_value(result).map_err(|e| {
+        log::warn!("load_fnl: deserialization failed: {e}");
+        e
+    })
 }
 
 #[cfg(test)]

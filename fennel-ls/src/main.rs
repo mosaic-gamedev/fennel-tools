@@ -20,6 +20,11 @@ struct Cli {
     #[arg(long)]
     no_formatting: bool,
 
+    /// Write logs to this file (defaults to stderr). Useful for debugging
+    /// since stdout is used for the LSP transport.
+    #[arg(long)]
+    log_file: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -34,9 +39,22 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
-
     let cli = Cli::parse();
+
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    );
+    if let Some(ref log_path) = cli.log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .expect("failed to open log file");
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+    builder.init();
+
+    log::info!("fennel-ls {} starting", env!("CARGO_PKG_VERSION"));
 
     let formatting_enabled = !cli.no_formatting;
 
