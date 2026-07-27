@@ -156,7 +156,7 @@ impl Backend {
                 if sym.is_def {
                     continue;
                 }
-                if sym.def_byte.is_none() && !builtins.is_known(&sym.name) {
+                if sym.def_byte.is_none() && !sym.in_macro && !builtins.is_known(&sym.name) {
                     let root = sym.name.split(['.', ':']).find(|s| !s.is_empty()).unwrap_or(&sym.name);
                     if !self.is_known_global(root) && !file.macro_globals.contains(root) {
                         diags.push(Diagnostic {

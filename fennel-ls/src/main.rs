@@ -104,7 +104,7 @@ fn run_check(files: Vec<std::path::PathBuf>) {
             if sym.is_def {
                 continue;
             }
-            if sym.def_byte.is_none() && !builtins.is_known(&sym.name) {
+            if sym.def_byte.is_none() && !sym.in_macro && !builtins.is_known(&sym.name) {
                 let root = sym.name.split(['.', ':']).find(|s| !s.is_empty()).unwrap_or(&sym.name);
                 if !server::known_global(root) {
                     println!(

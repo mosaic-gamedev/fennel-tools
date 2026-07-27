@@ -54,6 +54,10 @@ pub struct SymbolEntry {
     /// The byte offset of this symbol's definition, if known.
     pub def_byte: Option<u32>,
     pub is_def: bool,
+    /// True when this symbol appears inside the argument list of a macro call.
+    /// Unknown-identifier warnings are suppressed for these entries because macro
+    /// arguments are DSL forms that don't follow normal Fennel evaluation rules.
+    pub in_macro: bool,
 }
 
 // ── Scope ─────────────────────────────────────────────────────────────────────
@@ -192,6 +196,10 @@ struct Analyzer {
     scope_stack: Vec<usize>,
     /// Def-bytes of `var` bindings that appear as the target of at least one `set`.
     mutation_targets: std::collections::HashSet<u32>,
+    /// Nesting depth inside macro call argument lists.
+    /// While > 0, all emitted SymbolEntries are tagged `in_macro: true` and
+    /// unknown-identifier warnings are suppressed for them.
+    macro_depth: usize,
 }
 
 impl Analyzer {
@@ -200,6 +208,7 @@ impl Analyzer {
             result: AnalysisResult::default(),
             scope_stack: Vec::new(),
             mutation_targets: std::collections::HashSet::new(),
+            macro_depth: 0,
         }
     }
 
@@ -244,6 +253,7 @@ impl Analyzer {
             name: name.to_string(),
             def_byte: Some(byte),
             is_def: true,
+            in_macro: self.macro_depth > 0,
         });
         if let Some(scope_idx) = self.current_scope() {
             if name != "_" && self.result.scopes[scope_idx].bindings.contains_key(name) {
@@ -276,6 +286,7 @@ impl Analyzer {
             name: name.to_string(),
             def_byte,
             is_def: false,
+            in_macro: self.macro_depth > 0,
         });
         if let (Some(db), Some(rb)) = (def_byte, Some(span.start)) {
             self.result.refs.insert(rb, db);
@@ -393,10 +404,34 @@ impl Analyzer {
             Some("faccumulate") => self.analyze_faccumulate(forms, list_span),
             Some("with-open") => self.analyze_with_open(forms, list_span),
             Some("as->") => self.analyze_as_arrow(forms, list_span),
-            // Anything else: analyze head + args, then check arity
+            // Anything else: analyze head + args, then check arity.
+            // If the head resolves to a user-defined macro, its arguments are
+            // DSL forms whose semantics we can't know without expanding the macro.
+            // Analyze them anyway (for hover / completion / semantic tokens) but
+            // increment macro_depth so all emitted SymbolEntries are tagged
+            // in_macro=true and unknown-identifier warnings are suppressed.
             _ => {
-                self.analyze_forms(forms);
-                self.check_arity(forms, list_span);
+                let head_is_macro = (|| -> Option<bool> {
+                    let head_name = match &forms.first()?.node {
+                        Form::Symbol(s) => s.as_str(),
+                        _ => return None,
+                    };
+                    let def_byte = self.lookup(head_name)?;
+                    let def = self.result.defs.get(&def_byte)?;
+                    Some(matches!(def.kind, DefKind::Macro))
+                })().unwrap_or(false);
+
+                if head_is_macro {
+                    if let Some(head) = forms.first() {
+                        self.analyze(head);
+                    }
+                    self.macro_depth += 1;
+                    self.analyze_forms(&forms[1..]);
+                    self.macro_depth -= 1;
+                } else {
+                    self.analyze_forms(forms);
+                    self.check_arity(forms, list_span);
+                }
             }
         }
     }
@@ -823,14 +858,23 @@ impl Analyzer {
         }
         if let Form::Table(fields) = &forms[1].node {
             let mut i = 0;
-            while i + 1 < fields.len() {
-                // The VALUE (i+1) is always the local binding name:
-                //   {: foo}         → [sym(":"), sym("foo")]  → bind "foo"
-                //   {:remote local} → [kw(...), sym("local")] → bind "local"
-                if let Form::Symbol(name) = &fields[i + 1].node {
-                    self.define(name, &fields[i + 1].span, DefKind::Macro, None, None);
+            while i < fields.len() {
+                if i + 1 < fields.len() {
+                    // Paired element — binding name is always at fields[i+1]:
+                    //   {: foo}         → [sym(":"), sym("foo")]  → bind "foo"
+                    //   {:remote local} → [kw(...), sym("local")] → bind "local"
+                    if let Form::Symbol(name) = &fields[i + 1].node {
+                        self.define(name, &fields[i + 1].span, DefKind::Macro, None, None);
+                    }
+                    i += 2;
+                } else {
+                    // Standalone trailing symbol — shorthand for {: name}:
+                    //   {defnode}  →  bind "defnode"
+                    if let Form::Symbol(name) = &fields[i].node {
+                        self.define(name, &fields[i].span, DefKind::Macro, None, None);
+                    }
+                    i += 1;
                 }
-                i += 2;
             }
         }
     }
@@ -2335,6 +2379,40 @@ mod tests {
         let r = analyze_src("(import-macros {: foo :bar baz} :mylib) (foo 1) (baz 2)");
         assert!(!is_unknown(&r, "foo"), "import-macros call site `foo` must resolve");
         assert!(!is_unknown(&r, "baz"), "import-macros call site `baz` must resolve");
+    }
+
+    #[test]
+    fn import_macros_standalone_shorthand_binds() {
+        // {defnode} without a preceding colon should bind "defnode"
+        let r = analyze_src("(import-macros {defnode} :mylib)");
+        assert_eq!(def_kind(&r, "defnode"), Some(DefKind::Macro));
+    }
+
+    #[test]
+    fn macro_call_dsl_args_not_unknown() {
+        // DSL symbols in macro argument position must not be flagged as unknown
+        let r = analyze_src(
+            "(import-macros {defnode} :mylib) (defnode FennelNode (extends Base) (tool))"
+        );
+        let dsl_syms: Vec<_> = r.syms.iter()
+            .filter(|s| ["FennelNode", "extends", "Base", "tool"].contains(&s.name.as_str()))
+            .collect();
+        for s in &dsl_syms {
+            assert!(s.in_macro, "`{}` should be tagged in_macro", s.name);
+        }
+    }
+
+    #[test]
+    fn macro_call_nested_fn_params_resolve() {
+        // Inside a macro call, a (fn ...) sub-form should still bind its params
+        let r = analyze_src(
+            "(import-macros {defnode} :mylib) (defnode Foo (fn greet [self x] x))"
+        );
+        // `x` inside the fn should resolve to its param — def_byte not None
+        let x_ref = r.syms.iter()
+            .find(|s| s.name == "x" && !s.is_def)
+            .expect("x reference");
+        assert!(x_ref.def_byte.is_some(), "x should resolve to its param def");
     }
 
     // ── Destructuring edge cases ──────────────────────────────────────────────
