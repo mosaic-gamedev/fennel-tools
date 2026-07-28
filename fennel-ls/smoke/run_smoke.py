@@ -1568,6 +1568,64 @@ def run(binary):
     else:
         print("  SKIP  nested require-string goto-def (no result)")
 
+    # ── macro hooks ───────────────────────────────────────────────────────────
+    # Verifies end-to-end hook execution:
+    #   1. The .lsp.fnl in smoke/ registers a `defnode` hook for :simple-macros.
+    #   2. Opening hooks-macro.fnl triggers analysis → hook pass → second analysis.
+    #   3. After the hook pass, FennelNode3D (Bind), _ready and _process (AnalyzeFn)
+    #      are real definitions visible via workspace/symbol.
+    #   4. No unknown-identifier warnings appear (DSL args not analyzed).
+
+    print("\n=== macro hooks ===")
+    hooks_macro_path = os.path.join(SMOKE_DIR, "hooks-macro.fnl")
+    hooks_macro_uri = file_uri(hooks_macro_path)
+    hooks_macro_text = read_file(hooks_macro_path)
+
+    lsp.notify("textDocument/didOpen", {
+        "textDocument": {
+            "uri": hooks_macro_uri,
+            "languageId": "fennel",
+            "version": 1,
+            "text": hooks_macro_text,
+        }
+    })
+    # Barrier: documentSymbol ensures the first analysis pass is done.
+    lsp.request("textDocument/documentSymbol", {"textDocument": {"uri": hooks_macro_uri}})
+
+    # Wait for the hook pass to complete and re-publish diagnostics.
+    # Success condition: no unknown-identifier diagnostics (all macro args suppressed).
+    def no_unknown_in_hooks(params):
+        return all(
+            "unknown identifier" not in d.get("message", "")
+            for d in params.get("diagnostics", [])
+        )
+
+    diag, satisfied = lsp.wait_for_diagnostics(hooks_macro_uri, no_unknown_in_hooks, timeout=10.0)
+    check("no unknown-identifier warnings in hooks-macro.fnl",
+          satisfied,
+          f"last diags: {diag.get('diagnostics') if diag else 'none'}")
+
+    # FennelNode3D should be a real definition from the Bind instruction.
+    syms = lsp.request("workspace/symbol", {"query": "FennelNode3D"}).get("result") or []
+    names = [s["name"] for s in syms]
+    check("hook Bind creates FennelNode3D as a workspace symbol",
+          "FennelNode3D" in names,
+          f"got {names}")
+
+    # _ready should be a real Fn definition from the AnalyzeFn instruction.
+    syms = lsp.request("workspace/symbol", {"query": "_ready"}).get("result") or []
+    names = [s["name"] for s in syms]
+    check("hook AnalyzeFn creates _ready as a workspace symbol",
+          "_ready" in names,
+          f"got {names}")
+
+    # _process similarly.
+    syms = lsp.request("workspace/symbol", {"query": "_process"}).get("result") or []
+    names = [s["name"] for s in syms]
+    check("hook AnalyzeFn creates _process as a workspace symbol",
+          "_process" in names,
+          f"got {names}")
+
     lsp.close()
     return FAILURES
 

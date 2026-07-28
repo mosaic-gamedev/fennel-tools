@@ -42,6 +42,10 @@ pub struct DefinitionInfo {
     /// Static field names for table literals (`{:a 1 :b 2}` → `["a", "b"]`).
     /// Only set when the binding is a table with all-literal keys. Used for field completions.
     pub table_fields: Option<Vec<String>>,
+    /// For `DefKind::Macro` bindings: the module path from which this macro was
+    /// imported (e.g. `"addons.lua-gdextension.defnode"`). `None` for inline
+    /// `(macro ...)` / `(macros ...)` definitions.
+    pub source_module: Option<String>,
 }
 
 // ── Symbol reference ─────────────────────────────────────────────────────────
@@ -92,6 +96,11 @@ pub struct AnalysisResult {
     pub module_bindings: HashMap<String, String>,
     /// Maps def-byte → required module name for require bindings (used for unused-require check).
     pub require_def_bytes: HashMap<u32, String>,
+    /// Macro call sites found during analysis.
+    /// Each entry: (call_span_start, source_module, macro_name).
+    /// `source_module` is the module path from `import-macros`, or `None` for inline macros.
+    /// Used by the server to look up and execute the right hook.
+    pub macro_calls: Vec<(u32, Option<String>, String)>,
 }
 
 impl AnalysisResult {
@@ -200,6 +209,9 @@ struct Analyzer {
     /// While > 0, all emitted SymbolEntries are tagged `in_macro: true` and
     /// unknown-identifier warnings are suppressed for them.
     macro_depth: usize,
+    /// Hook results from a previous hook-runner pass, keyed by call_span_start.
+    /// When populated, the catch-all macro branch uses these instead of in_macro tagging.
+    hook_results: HashMap<u32, Vec<crate::hooks::Instruction>>,
 }
 
 impl Analyzer {
@@ -209,7 +221,12 @@ impl Analyzer {
             scope_stack: Vec::new(),
             mutation_targets: std::collections::HashSet::new(),
             macro_depth: 0,
+            hook_results: HashMap::new(),
         }
+    }
+
+    fn new_with_hooks(hook_results: HashMap<u32, Vec<crate::hooks::Instruction>>) -> Self {
+        Self { hook_results, ..Self::new() }
     }
 
     fn push_scope(&mut self, span: Span) -> usize {
@@ -246,6 +263,7 @@ impl Analyzer {
                 variadic: false,
                 returns_multiple: false,
                 table_fields: None,
+                source_module: None,
             },
         );
         self.result.syms.push(SymbolEntry {
@@ -405,32 +423,76 @@ impl Analyzer {
             Some("with-open") => self.analyze_with_open(forms, list_span),
             Some("as->") => self.analyze_as_arrow(forms, list_span),
             // Anything else: analyze head + args, then check arity.
-            // If the head resolves to a user-defined macro, its arguments are
-            // DSL forms whose semantics we can't know without expanding the macro.
-            // Analyze them anyway (for hover / completion / semantic tokens) but
-            // increment macro_depth so all emitted SymbolEntries are tagged
-            // in_macro=true and unknown-identifier warnings are suppressed.
+            // If the head resolves to a user-defined macro, record the call site and
+            // either execute cached hook instructions (giving full LSP support) or
+            // fall back to in_macro tagging (suppressing unknown-identifier warnings).
             _ => {
-                let head_is_macro = (|| -> Option<bool> {
+                let macro_info = (|| -> Option<(String, Option<String>)> {
                     let head_name = match &forms.first()?.node {
-                        Form::Symbol(s) => s.as_str(),
+                        Form::Symbol(s) => s.clone(),
                         _ => return None,
                     };
-                    let def_byte = self.lookup(head_name)?;
+                    let def_byte = self.lookup(&head_name)?;
                     let def = self.result.defs.get(&def_byte)?;
-                    Some(matches!(def.kind, DefKind::Macro))
-                })().unwrap_or(false);
+                    if matches!(def.kind, DefKind::Macro) {
+                        Some((head_name, def.source_module.clone()))
+                    } else {
+                        None
+                    }
+                })();
 
-                if head_is_macro {
+                if let Some((macro_name, source_module)) = macro_info {
+                    self.result.macro_calls.push((list_span.start, source_module, macro_name.clone()));
                     if let Some(head) = forms.first() {
                         self.analyze(head);
                     }
-                    self.macro_depth += 1;
-                    self.analyze_forms(&forms[1..]);
-                    self.macro_depth -= 1;
+                    if let Some(instrs) = self.hook_results.get(&list_span.start).cloned() {
+                        self.execute_hook_instructions(&instrs, forms);
+                    } else {
+                        self.macro_depth += 1;
+                        self.analyze_forms(&forms[1..]);
+                        self.macro_depth -= 1;
+                    }
                 } else {
                     self.analyze_forms(forms);
                     self.check_arity(forms, list_span);
+                }
+            }
+        }
+    }
+
+    /// Execute hook instructions for a macro call.
+    ///
+    /// `forms` is the full child list including the macro head at index 0.
+    /// Instruction indices are 1-based (matching Lua convention), so index N maps
+    /// to `forms[N-1]`.
+    fn execute_hook_instructions(&mut self, instructions: &[crate::hooks::Instruction], forms: &[AstNode]) {
+        use crate::hooks::Instruction;
+        for instr in instructions {
+            match instr {
+                Instruction::Bind { name, span } => {
+                    self.define(name, span, DefKind::Local, None, None);
+                }
+                Instruction::Analyze { index } => {
+                    if let Some(form) = forms.get(index - 1) {
+                        self.analyze(form);
+                    }
+                }
+                Instruction::AnalyzeFn { index } => {
+                    if let Some(form) = forms.get(index - 1) {
+                        if let Form::List(sub_forms) = &form.node {
+                            self.analyze_fn(sub_forms, &form.span);
+                        }
+                    }
+                }
+                Instruction::ScopeOpen { span } => {
+                    self.push_scope(span.clone());
+                }
+                Instruction::ScopeClose => {
+                    self.pop_scope();
+                }
+                Instruction::SubFormCompletions { .. } => {
+                    // TODO: store in AnalysisResult for position-based completion
                 }
             }
         }
@@ -856,6 +918,12 @@ impl Analyzer {
         if forms.len() < 2 {
             return;
         }
+        // Extract the module path string (forms[2] is the module argument).
+        let source_module: Option<String> = forms.get(2).and_then(|n| match &n.node {
+            Form::Keyword(s) | Form::Str(s) => Some(s.clone()),
+            _ => None,
+        });
+
         if let Form::Table(fields) = &forms[1].node {
             let mut i = 0;
             while i < fields.len() {
@@ -864,14 +932,20 @@ impl Analyzer {
                     //   {: foo}         → [sym(":"), sym("foo")]  → bind "foo"
                     //   {:remote local} → [kw(...), sym("local")] → bind "local"
                     if let Form::Symbol(name) = &fields[i + 1].node {
-                        self.define(name, &fields[i + 1].span, DefKind::Macro, None, None);
+                        let byte = self.define(name, &fields[i + 1].span, DefKind::Macro, None, None);
+                        if let Some(def) = self.result.defs.get_mut(&byte) {
+                            def.source_module = source_module.clone();
+                        }
                     }
                     i += 2;
                 } else {
                     // Standalone trailing symbol — shorthand for {: name}:
                     //   {defnode}  →  bind "defnode"
                     if let Form::Symbol(name) = &fields[i].node {
-                        self.define(name, &fields[i].span, DefKind::Macro, None, None);
+                        let byte = self.define(name, &fields[i].span, DefKind::Macro, None, None);
+                        if let Some(def) = self.result.defs.get_mut(&byte) {
+                            def.source_module = source_module.clone();
+                        }
                     }
                     i += 1;
                 }
@@ -1403,7 +1477,14 @@ fn tail_may_return_multiple(node: &AstNode) -> bool {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
-    let mut analyzer = Analyzer::new();
+    analyze_with_hooks(ast, &HashMap::new())
+}
+
+pub fn analyze_with_hooks(
+    ast: &[AstNode],
+    hook_results: &HashMap<u32, Vec<crate::hooks::Instruction>>,
+) -> AnalysisResult {
+    let mut analyzer = Analyzer::new_with_hooks(hook_results.clone());
 
     // Global scope covering the entire file (span 0..u32::MAX is fine)
     let global_span = if let (Some(first), Some(last)) = (ast.first(), ast.last()) {
@@ -2413,6 +2494,181 @@ mod tests {
             .find(|s| s.name == "x" && !s.is_def)
             .expect("x reference");
         assert!(x_ref.def_byte.is_some(), "x should resolve to its param def");
+    }
+
+    // ── source_module on import-macros defs ──────────────────────────────────
+
+    fn source_module_of(r: &AnalysisResult, name: &str) -> Option<String> {
+        r.defs.values()
+            .find(|d| d.name == name && d.kind == DefKind::Macro)
+            .and_then(|d| d.source_module.clone())
+    }
+
+    #[test]
+    fn import_macros_keyword_module_stored_on_def() {
+        let r = analyze_src("(import-macros {: defnode} :addons.lua-gdextension.defnode)");
+        assert_eq!(
+            source_module_of(&r, "defnode").as_deref(),
+            Some("addons.lua-gdextension.defnode"),
+            "source_module should be the keyword module path"
+        );
+    }
+
+    #[test]
+    fn import_macros_string_module_stored_on_def() {
+        let r = analyze_src(r#"(import-macros {: defnode} "addons.lua-gdextension.defnode")"#);
+        assert_eq!(
+            source_module_of(&r, "defnode").as_deref(),
+            Some("addons.lua-gdextension.defnode")
+        );
+    }
+
+    #[test]
+    fn import_macros_standalone_shorthand_stores_module() {
+        let r = analyze_src("(import-macros {defnode} :mylib)");
+        assert_eq!(source_module_of(&r, "defnode").as_deref(), Some("mylib"));
+    }
+
+    #[test]
+    fn inline_macro_has_no_source_module() {
+        let r = analyze_src("(macro my-mac [x] `(local ,x nil))");
+        assert_eq!(source_module_of(&r, "my-mac"), None,
+            "inline macro should have no source_module");
+    }
+
+    #[test]
+    fn macros_form_has_no_source_module() {
+        let r = analyze_src("(macros {:my-mac (fn [x] `(local ,x nil))})");
+        assert_eq!(source_module_of(&r, "my-mac"), None);
+    }
+
+    // ── macro_calls tracking ─────────────────────────────────────────────────
+
+    #[test]
+    fn macro_calls_populated_for_import_macros_call() {
+        let r = analyze_src(
+            "(import-macros {: defnode} :mylib) (defnode Foo (extends Bar))"
+        );
+        let call = r.macro_calls.iter()
+            .find(|(_, _, name)| name == "defnode")
+            .expect("defnode call should be recorded");
+        assert_eq!(call.1.as_deref(), Some("mylib"), "source_module should be mylib");
+    }
+
+    #[test]
+    fn macro_calls_has_none_source_module_for_inline_macro() {
+        let r = analyze_src("(macro m [x] `(local ,x 1)) (m foo)");
+        let call = r.macro_calls.iter()
+            .find(|(_, _, name)| name == "m")
+            .expect("m call should be recorded");
+        assert!(call.1.is_none(), "inline macro call should have None source_module");
+    }
+
+    #[test]
+    fn macro_calls_not_populated_for_regular_functions() {
+        let r = analyze_src("(fn greet [x] x) (greet 42)");
+        assert!(r.macro_calls.is_empty(), "regular fn calls should not appear in macro_calls");
+    }
+
+    // ── analyze_with_hooks: instruction execution ─────────────────────────────
+
+    fn make_hook_results(span_start: u32, instrs: Vec<crate::hooks::Instruction>) -> HashMap<u32, Vec<crate::hooks::Instruction>> {
+        let mut m = HashMap::new();
+        m.insert(span_start, instrs);
+        m
+    }
+
+    #[test]
+    fn hook_bind_instruction_introduces_def() {
+        // Without a hook, FennelNode3D would be in_macro.
+        // With a Bind instruction it should be a real Local def.
+        let src = "(import-macros {: defnode} :mylib) (defnode FennelNode3D)";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let first_pass = analyze(&ast);
+
+        // Find the span of the defnode call
+        let call_span = first_pass.macro_calls.iter()
+            .find(|(_, _, n)| n == "defnode")
+            .map(|(s, _, _)| *s)
+            .expect("defnode call");
+
+        // Build the span for "FennelNode3D" — it follows "defnode " at the call site
+        let name_span = first_pass.syms.iter()
+            .find(|s| s.name == "FennelNode3D")
+            .map(|s| s.span.clone())
+            .expect("FennelNode3D sym");
+
+        let hook_results = make_hook_results(call_span, vec![
+            crate::hooks::Instruction::Bind {
+                name: "FennelNode3D".into(),
+                span: name_span,
+            },
+        ]);
+        let second_pass = analyze_with_hooks(&ast, &hook_results);
+
+        // Should be a proper def now, not in_macro
+        let def = second_pass.defs.values()
+            .find(|d| d.name == "FennelNode3D")
+            .expect("FennelNode3D def");
+        assert_eq!(def.kind, DefKind::Local);
+
+        let sym = second_pass.syms.iter()
+            .find(|s| s.name == "FennelNode3D" && s.is_def)
+            .expect("FennelNode3D sym entry");
+        assert!(!sym.in_macro, "bound name should not be tagged in_macro");
+    }
+
+    #[test]
+    fn hook_analyze_fn_instruction_binds_fn_name_and_params() {
+        // (import-macros {: defnode} :mylib)
+        // (defnode Foo (fn greet [self x] x))
+        // With AnalyzeFn on the (fn ...) child, greet and self/x should be real defs.
+        let src = "(import-macros {: defnode} :mylib) (defnode Foo (fn greet [self x] x))";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let first_pass = analyze(&ast);
+
+        let call_span = first_pass.macro_calls.iter()
+            .find(|(_, _, n)| n == "defnode")
+            .map(|(s, _, _)| *s)
+            .expect("defnode call");
+
+        // The (fn greet ...) form is at index 2 of the defnode call (1-based: index 3).
+        // In forms[], that's forms[2] (0-based). AnalyzeFn { index: 3 } → forms[2].
+        let hook_results = make_hook_results(call_span, vec![
+            crate::hooks::Instruction::AnalyzeFn { index: 3 },
+        ]);
+        let second_pass = analyze_with_hooks(&ast, &hook_results);
+
+        assert!(has_def(&second_pass, "greet"), "greet should be a def via AnalyzeFn");
+        assert_eq!(def_kind(&second_pass, "greet"), Some(DefKind::Fn));
+        assert!(has_def(&second_pass, "self"), "self param should be a def");
+        assert!(has_def(&second_pass, "x"), "x param should be a def");
+        // x in the body should resolve to the param
+        assert!(!is_unknown(&second_pass, "x"), "x in body should resolve");
+    }
+
+    #[test]
+    fn hook_instructions_suppress_in_macro_tagging() {
+        // When a hook is provided, forms handled by it should NOT be in_macro.
+        // Forms not mentioned remain unanalyzed (no SymbolEntry at all).
+        let src = "(import-macros {: defnode} :mylib) (defnode Foo (extends Base))";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let first_pass = analyze(&ast);
+
+        let call_span = first_pass.macro_calls.iter()
+            .find(|(_, _, n)| n == "defnode")
+            .map(|(s, _, _)| *s)
+            .expect("defnode call");
+
+        // Hook provides no instructions (empty vec = hook present, skip all args)
+        let hook_results = make_hook_results(call_span, vec![]);
+        let second_pass = analyze_with_hooks(&ast, &hook_results);
+
+        // extends and Base should not appear in syms (not analyzed at all)
+        let base_syms: Vec<_> = second_pass.syms.iter()
+            .filter(|s| s.name == "Base")
+            .collect();
+        assert!(base_syms.is_empty(), "Base should not be in syms when hook skips it");
     }
 
     // ── Destructuring edge cases ──────────────────────────────────────────────

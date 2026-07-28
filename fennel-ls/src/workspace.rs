@@ -95,6 +95,49 @@ pub struct AnalyzedFile {
     /// Names introduced by macro expansion (e.g. via `import-macros`).
     /// Populated asynchronously after the initial analysis pass.
     pub macro_globals: HashSet<String>,
+    /// Macro call sites that have no hook defined, for optional diagnostics.
+    /// Populated by the hook runner pass; empty when warn-unhooked-macros is off.
+    pub unhooked_macros: Vec<(crate::lexer::Span, String)>,
+}
+
+impl AnalyzedFile {
+    /// Find the list node (macro call) whose span starts at `byte`.
+    /// Used to build a `SerialNode` for hook execution.
+    pub fn find_list_at(&self, byte: u32) -> Option<&AstNode> {
+        fn search(node: &AstNode, target: u32) -> Option<&AstNode> {
+            if node.span.start == target {
+                if let crate::parser::Form::List(_) = &node.node {
+                    return Some(node);
+                }
+            }
+            match &node.node {
+                crate::parser::Form::List(ch)
+                | crate::parser::Form::Table(ch)
+                | crate::parser::Form::Sequence(ch) => {
+                    for child in ch {
+                        if let Some(found) = search(child, target) {
+                            return Some(found);
+                        }
+                    }
+                }
+                crate::parser::Form::Quote(inner)
+                | crate::parser::Form::Quasiquote(inner)
+                | crate::parser::Form::Unquote(inner)
+                | crate::parser::Form::UnquoteSplice(inner)
+                | crate::parser::Form::HashFn(inner) => {
+                    return search(inner, target);
+                }
+                _ => {}
+            }
+            None
+        }
+        for top in &self.ast {
+            if let Some(found) = search(top, byte) {
+                return Some(found);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -149,12 +192,16 @@ impl Workspace {
     ///
     /// `workspace_root` is used to resolve `(require :mod)` to `.fnl` paths.
     /// Pass `None` (e.g. in tests) to skip cross-file resolution.
+    ///
+    /// `hook_results` is an optional map of macro call span → hook instructions
+    /// from a previous hook-runner pass. Pass an empty map on the first pass.
     pub fn update(
         &self,
         uri: Url,
         text: String,
         version: i32,
         workspace_root: Option<&std::path::Path>,
+        hook_results: &HashMap<u32, Vec<crate::hooks::Instruction>>,
     ) {
         // Invalidate the require_cache entry for this file so callers get
         // fresh exports after edits.
@@ -163,7 +210,7 @@ impl Workspace {
         }
 
         let (ast, parse_errors) = crate::parser::Parser::parse(&text);
-        let analysis = crate::analyzer::analyze(&ast);
+        let analysis = crate::analyzer::analyze_with_hooks(&ast, hook_results);
 
         // Resolve require bindings → module exports
         let mut modules: HashMap<String, Arc<ModuleExports>> = HashMap::new();
@@ -188,6 +235,7 @@ impl Workspace {
                 analysis,
                 modules,
                 macro_globals: HashSet::new(),
+                unhooked_macros: Vec::new(),
             },
         );
     }
@@ -202,10 +250,16 @@ impl Workspace {
     }
 
     /// Merge macro-expansion results into the file's scope.
-    /// Called asynchronously after initial analysis; triggers a diagnostic re-publish.
     pub fn set_macro_globals(&self, uri: &Url, names: HashSet<String>) {
         if let Some(mut entry) = self.files.get_mut(&uri.to_string()) {
             entry.macro_globals = names;
+        }
+    }
+
+    /// Store macro call sites that have no hook defined (for optional diagnostics).
+    pub fn set_unhooked_macros(&self, uri: &Url, spans: Vec<(crate::lexer::Span, String)>) {
+        if let Some(mut entry) = self.files.get_mut(&uri.to_string()) {
+            entry.unhooked_macros = spans;
         }
     }
 
@@ -557,6 +611,7 @@ mod tests {
             "(local utils (require :utils))\n(utils.greet \"world\")".to_string(),
             1,
             Some(dir.path()),
+            &Default::default(),
         );
 
         let has_module = ws.with_file(&uri, |f| f.modules.contains_key("utils"));
@@ -572,6 +627,7 @@ mod tests {
             "(local x (require :utils))".to_string(),
             1,
             None,
+            &Default::default(),
         );
         let module_count = ws.with_file(&uri, |f| f.modules.len());
         assert_eq!(module_count, Some(0));
@@ -639,7 +695,7 @@ mod tests {
 
         // Update the file via the LSP — cache should be invalidated
         let uri = Url::from_file_path(&fnl_path).unwrap();
-        ws.update(uri, "(fn new [] nil)".to_string(), 1, None);
+        ws.update(uri, "(fn new [] nil)".to_string(), 1, None, &Default::default());
         assert!(!ws.require_cache.contains_key(&fnl_path), "cache should be cleared on update");
     }
 
@@ -698,6 +754,7 @@ mod tests {
             "(local api (require :api))\n(api.helper 1)".to_string(),
             1,
             Some(dir.path()),
+            &Default::default(),
         );
 
         let module_found = ws.with_file(&uri, |f| f.modules.contains_key("api"));
@@ -786,6 +843,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join("middle.fnl")).unwrap(),
             1,
             Some(dir.path()),
+            &Default::default(),
         );
 
         let lua_module_resolved = ws

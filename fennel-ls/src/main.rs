@@ -4,6 +4,7 @@ mod lua_to_fennel;
 mod docs;
 mod expander;
 mod fmt;
+mod hooks;
 mod lexer;
 mod parser;
 mod server;

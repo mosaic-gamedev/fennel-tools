@@ -23,6 +23,11 @@ pub struct Config {
     /// Per-symbol hover documentation. Keys are exact Fennel symbols (dots for namespaces).
     #[serde(alias = "global-docs")]
     pub global_docs: Option<HashMap<String, GlobalDoc>>,
+
+    /// Emit a hint-level diagnostic on macro calls that have no hook defined.
+    /// Default: false. Enable with `:warn-unhooked-macros true` in `.lsp.fnl`.
+    #[serde(alias = "warn-unhooked-macros")]
+    pub warn_unhooked_macros: Option<bool>,
 }
 
 impl Config {

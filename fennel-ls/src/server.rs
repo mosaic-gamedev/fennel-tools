@@ -36,6 +36,8 @@ pub struct Backend {
     /// Monotonic counter for unique semantic token result IDs.
     token_id_counter: AtomicU64,
     expander: crate::expander::MacroExpander,
+    hook_runner: crate::hooks::HookRunner,
+    warn_unhooked_macros: std::sync::atomic::AtomicBool,
 }
 
 impl Backend {
@@ -50,6 +52,8 @@ impl Backend {
             semantic_token_cache: DashMap::new(),
             token_id_counter: AtomicU64::new(1),
             expander: crate::expander::MacroExpander::new(),
+            hook_runner: crate::hooks::HookRunner::new(),
+            warn_unhooked_macros: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -89,6 +93,78 @@ impl Backend {
             Some(all_globals)
         };
         *self.global_docs.write().unwrap() = config.global_docs;
+
+        self.warn_unhooked_macros.store(
+            config.warn_unhooked_macros.unwrap_or(false),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        // Pass `.lsp.fnl` source to the hook runner so it can extract `:macro-hooks`.
+        if let Ok(src) = std::fs::read_to_string(root.join(".lsp.fnl")) {
+            let search_path = root.to_string_lossy().into_owned();
+            self.hook_runner.try_set_source(src, search_path);
+        }
+    }
+
+    /// Run hooks for all macro calls in `uri` and return a map of
+    /// call_span_start → instructions. Returns empty if no hooks are configured.
+    async fn compute_hooks(
+        &self,
+        uri: &Url,
+        version: i32,
+    ) -> std::collections::HashMap<u32, Vec<crate::hooks::Instruction>> {
+        use crate::hooks::SerialNode;
+
+        // Collect macro call info from the current analysis.
+        let macro_calls: Vec<(u32, Option<String>, String)> = self
+            .workspace
+            .with_file(uri, |f| f.analysis.macro_calls.clone())
+            .unwrap_or_default();
+
+        if macro_calls.is_empty() {
+            return std::collections::HashMap::new();
+        }
+
+        let warn = self.warn_unhooked_macros.load(std::sync::atomic::Ordering::Relaxed);
+        let mut results = std::collections::HashMap::new();
+        let mut unhooked: Vec<(crate::lexer::Span, String)> = Vec::new();
+
+        for (span_start, source_module, macro_name) in macro_calls {
+            let call_node = self
+                .workspace
+                .with_file(uri, |f| f.find_list_at(span_start).map(SerialNode::from_ast))
+                .flatten();
+            let Some(call_node) = call_node else { continue };
+
+            let module_str = source_module.as_deref().unwrap_or("");
+            match self.hook_runner.run_hook(module_str, &macro_name, call_node).await {
+                Some(instrs) => {
+                    results.insert(span_start, instrs);
+                }
+                None if warn => {
+                    // No hook registered — record the call site for the diagnostic.
+                    let span = self
+                        .workspace
+                        .with_file(uri, |f| {
+                            f.find_list_at(span_start).map(|n| n.span.clone())
+                        })
+                        .flatten();
+                    if let Some(span) = span {
+                        unhooked.push((span, macro_name));
+                    }
+                }
+                None => {}
+            }
+        }
+
+        if !unhooked.is_empty() {
+            self.workspace.set_unhooked_macros(uri, unhooked);
+        } else {
+            self.workspace.set_unhooked_macros(uri, vec![]);
+        }
+
+        self.hook_runner.store_results(uri.to_string(), version, results.clone());
+        results
     }
 
     /// Compile `text` with Fennel and merge any macro-introduced names into
@@ -151,6 +227,22 @@ impl Backend {
                 });
             }
 
+            // Macro calls with no hook definition (optional, toggled by warn-unhooked-macros)
+            for (span, macro_name) in &file.unhooked_macros {
+                diags.push(Diagnostic {
+                    range: text::span_to_range(&file.text, span),
+                    severity: Some(DiagnosticSeverity::HINT),
+                    message: format!(
+                        "macro `{}` has no hook definition; \
+                         add one under :macro-hooks in .lsp.fnl for better analysis",
+                        macro_name
+                    ),
+                    source: Some("fennel-ls".into()),
+                    code: Some(NumberOrString::String("unhooked-macro".into())),
+                    ..Default::default()
+                });
+            }
+
             // Undefined symbols (not in scope and not a builtin)
             for sym in &file.analysis.syms {
                 if sym.is_def {
@@ -178,6 +270,25 @@ impl Backend {
                 .publish_diagnostics(uri, diags, None)
                 .await;
         }
+    }
+
+    async fn open_or_change(&self, uri: Url, text: String, version: i32) {
+        let root = self.workspace_root.get().map(|p| p.as_path());
+
+        // Pass 1: sync analysis with any cached hook results from a prior run.
+        let cached = self.hook_runner.cached_results(uri.as_str(), version)
+            .unwrap_or_default();
+        self.workspace.update(uri.clone(), text.clone(), version, root, &cached);
+        self.publish_diagnostics(uri.clone()).await;
+
+        // Run hooks and do a second analysis pass if we got new results.
+        let hook_results = self.compute_hooks(&uri, version).await;
+        if !hook_results.is_empty() {
+            self.workspace.update(uri.clone(), text.clone(), version, root, &hook_results);
+            self.publish_diagnostics(uri.clone()).await;
+        }
+
+        self.run_macro_expansion(uri, text).await;
     }
 }
 
@@ -378,34 +489,18 @@ impl LanguageServer for Backend {
         let doc = params.text_document;
         let text = doc.text.clone();
         let uri = doc.uri.clone();
-        self.workspace.update(
-            uri.clone(),
-            text.clone(),
-            doc.version,
-            self.workspace_root.get().map(|p| p.as_path()),
-        );
-        self.publish_diagnostics(uri.clone()).await;
-        self.run_macro_expansion(uri, text).await;
+        self.open_or_change(uri, text, doc.version).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
-
         let current = self.workspace.with_file(&uri, |f| f.text.clone());
         let text = apply_incremental_changes(
             current.unwrap_or_default(),
             params.content_changes,
         );
-
-        self.workspace.update(
-            uri.clone(),
-            text.clone(),
-            version,
-            self.workspace_root.get().map(|p| p.as_path()),
-        );
-        self.publish_diagnostics(uri.clone()).await;
-        self.run_macro_expansion(uri, text).await;
+        self.open_or_change(uri, text, version).await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -507,7 +602,7 @@ impl LanguageServer for Backend {
                     FileChangeType::CHANGED | FileChangeType::CREATED => {
                         if let Ok(path) = uri.to_file_path() {
                             if let Ok(text) = std::fs::read_to_string(&path) {
-                                self.workspace.update(uri.clone(), text, 0, root);
+                                self.workspace.update(uri.clone(), text, 0, root, &Default::default());
                                 self.publish_diagnostics(uri).await;
                             }
                         }
@@ -580,7 +675,7 @@ impl LanguageServer for Backend {
                     self.workspace.invalidate_require_cache(&path);
                     // If the new file already has content (e.g. from a template), index it.
                     if let Ok(text) = std::fs::read_to_string(&path) {
-                        self.workspace.update(uri, text, 0, root);
+                        self.workspace.update(uri, text, 0, root, &Default::default());
                     }
                 }
             }
@@ -664,7 +759,7 @@ impl LanguageServer for Backend {
                 if let Ok(path) = new_uri.to_file_path() {
                     self.workspace.invalidate_require_cache(&path);
                     if let Ok(text) = std::fs::read_to_string(&path) {
-                        self.workspace.update(new_uri, text, 0, root);
+                        self.workspace.update(new_uri, text, 0, root, &Default::default());
                     }
                 }
             }
@@ -1070,8 +1165,14 @@ impl LanguageServer for Backend {
                         if !name.starts_with(pfx.as_str()) { continue; }
                     }
                     if seen.insert(name.clone()) {
+                        // insert_text is the suffix after the already-typed prefix so
+                        // editors don't double-insert the prefix (e.g. gd.gd.Node3D).
+                        let insert_text = multisym_prefix.as_deref()
+                            .and_then(|pfx| name.get(pfx.len()..))
+                            .map(|s| s.to_string());
                         items.push(CompletionItem {
                             label: name.clone(),
+                            insert_text,
                             kind: Some(CompletionItemKind::FUNCTION),
                             detail: Some(doc.signature.clone()),
                             documentation: doc.doc.as_ref().map(|d| {
@@ -1098,6 +1199,7 @@ impl LanguageServer for Backend {
                         if seen.insert(full_label.clone()) {
                             items.push(CompletionItem {
                                 label: full_label,
+                                insert_text: Some(name.clone()),
                                 kind: Some(match def.kind {
                                     DefKind::Fn | DefKind::Macro => CompletionItemKind::FUNCTION,
                                     _ => CompletionItemKind::VARIABLE,
@@ -1131,6 +1233,7 @@ impl LanguageServer for Backend {
                             if seen.insert(full_label.clone()) {
                                 items.push(CompletionItem {
                                     label: full_label,
+                                    insert_text: Some(field.clone()),
                                     kind: Some(CompletionItemKind::FIELD),
                                     ..Default::default()
                                 });
@@ -2784,7 +2887,7 @@ mod tests {
         params: Option<Vec<String>>,
         doc: Option<String>,
     ) -> DefinitionInfo {
-        DefinitionInfo { name: name.into(), kind, span: dummy_span(), params, doc, variadic: false, returns_multiple: false, table_fields: None }
+        DefinitionInfo { name: name.into(), kind, span: dummy_span(), params, doc, variadic: false, returns_multiple: false, table_fields: None, source_module: None }
     }
 
     // ── format_definition ─────────────────────────────────────────────────────
@@ -3093,7 +3196,7 @@ mod tests {
     fn ws_uri(src: &str) -> (Workspace, Url) {
         let ws = Workspace::new();
         let uri = Url::parse("file:///ch_test.fnl").unwrap();
-        ws.update(uri.clone(), src.to_string(), 1, None);
+        ws.update(uri.clone(), src.to_string(), 1, None, &Default::default());
         (ws, uri)
     }
 
@@ -3713,7 +3816,7 @@ mod tests {
     fn ws_with_require(root: &std::path::Path, main_src: &str) -> (Workspace, Url) {
         let ws = Workspace::new();
         let uri = Url::parse("file:///main.fnl").unwrap();
-        ws.update(uri.clone(), main_src.to_string(), 1, Some(root));
+        ws.update(uri.clone(), main_src.to_string(), 1, Some(root), &Default::default());
         (ws, uri)
     }
 
@@ -3871,7 +3974,7 @@ mod tests {
     fn workspace_symbol_finds_def_in_open_file() {
         let ws = Workspace::new();
         let uri = Url::parse("file:///main.fnl").unwrap();
-        ws.update(uri, "(fn greet [x] x) (local msg \"hi\")".to_string(), 1, None);
+        ws.update(uri, "(fn greet [x] x) (local msg \"hi\")".to_string(), 1, None, &Default::default());
         let defs = ws.all_defs("gre");
         assert!(defs.iter().any(|(_, _, d)| d.name == "greet"), "greet not found: {defs:?}");
     }
@@ -3880,7 +3983,7 @@ mod tests {
     fn workspace_symbol_empty_query_returns_all() {
         let ws = Workspace::new();
         let uri = Url::parse("file:///main.fnl").unwrap();
-        ws.update(uri, "(fn alpha []) (fn beta [])".to_string(), 1, None);
+        ws.update(uri, "(fn alpha []) (fn beta [])".to_string(), 1, None, &Default::default());
         let defs = ws.all_defs("");
         let names: Vec<_> = defs.iter().map(|(_, _, d)| d.name.as_str()).collect();
         assert!(names.contains(&"alpha") && names.contains(&"beta"), "{names:?}");
@@ -3890,7 +3993,7 @@ mod tests {
     fn workspace_symbol_case_insensitive() {
         let ws = Workspace::new();
         let uri = Url::parse("file:///main.fnl").unwrap();
-        ws.update(uri, "(fn Greet [x] x)".to_string(), 1, None);
+        ws.update(uri, "(fn Greet [x] x)".to_string(), 1, None, &Default::default());
         let defs = ws.all_defs("greet");
         assert!(defs.iter().any(|(_, _, d)| d.name == "Greet"), "case-insensitive miss: {defs:?}");
     }
