@@ -494,6 +494,17 @@ impl Analyzer {
                 Instruction::SubFormCompletions { .. } => {
                     // TODO: store in AnalysisResult for position-based completion
                 }
+                Instruction::AnalyzeChildAt { parent, child } => {
+                    if let Some(parent_form) = forms.get(parent - 1) {
+                        let sub = match &parent_form.node {
+                            Form::List(ch) | Form::Sequence(ch) => Some(ch),
+                            _ => None,
+                        };
+                        if let Some(sub_node) = sub.and_then(|ch| ch.get(child - 1)) {
+                            self.analyze(sub_node);
+                        }
+                    }
+                }
             }
         }
     }

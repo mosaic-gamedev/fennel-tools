@@ -38,6 +38,12 @@
 ///   {:type "sub-form-completions" :index 3 :completions ["extends" "fn" "signal"]}
 ///     — when the cursor is inside call.children[3], offer these fixed completions
 ///
+///   {:type "analyze-child-at" :parent 5 :child 3}
+///     — resolve references inside call.children[5].children[3] as normal Fennel
+///       code; useful for analyzing specific sub-expressions of DSL sub-forms
+///       (e.g. the type arg of an `(export name type default)` sub-form) without
+///       triggering spurious warnings about the DSL head symbol itself
+///
 /// Children NOT mentioned by any instruction are silently skipped (no analysis,
 /// no unknown-identifier warnings).
 ///
@@ -151,6 +157,8 @@ pub enum Instruction {
     ScopeClose,
     /// When the cursor is inside call.children[index], offer these completions (1-based).
     SubFormCompletions { index: usize, completions: Vec<String> },
+    /// Analyze call.children[parent].children[child] as normal Fennel code (both 1-based).
+    AnalyzeChildAt { parent: usize, child: usize },
 }
 
 impl Instruction {
@@ -175,6 +183,10 @@ impl Instruction {
                     .collect();
                 Ok(Self::SubFormCompletions { index: t.get("index")?, completions })
             }
+            "analyze-child-at" => Ok(Self::AnalyzeChildAt {
+                parent: t.get("parent")?,
+                child: t.get("child")?,
+            }),
             other => Err(LuaError::RuntimeError(
                 format!("unknown hook instruction type: {other}")
             )),
@@ -544,6 +556,14 @@ mod tests {
         register(&lua, "{:macro-hooks {:m (fn [_] [{:type \"analyze-fn\" :index 3}])}}");
         let result = run(&lua, "", "m", &dummy_call()).unwrap();
         assert!(matches!(result[0], Instruction::AnalyzeFn { index: 3 }));
+    }
+
+    #[test]
+    fn analyze_child_at_instruction_round_trips() {
+        let lua = make_lua();
+        register(&lua, "{:macro-hooks {:m (fn [_] [{:type \"analyze-child-at\" :parent 5 :child 3}])}}");
+        let result = run(&lua, "", "m", &dummy_call()).unwrap();
+        assert!(matches!(result[0], Instruction::AnalyzeChildAt { parent: 5, child: 3 }));
     }
 
     #[test]
