@@ -221,6 +221,9 @@ enum HookMessage {
 const FENNEL_SRC: &str = include_str!("../vendor/fennel.lua");
 
 const HOOK_HELPER: &str = r#"
+-- Install Fennel's require searcher so .fnl modules required from .lsp.fnl resolve correctly.
+fennel.install()
+
 -- _hooks layout after register_hooks:
 --   _hooks["module.path"]["macro_name"] = fn   -- from nested {:module {:name fn}}
 --   _hooks[""]["macro_name"]            = fn   -- from flat {:macro_name fn} (any module)
@@ -234,7 +237,12 @@ function register_hooks(src, search_path)
         fennel.path = prefix .. orig_path
         fennel["macro-path"] = prefix .. orig_macro_path
     end
+    -- Snapshot package.loaded so modules required during eval don't persist
+    -- across register_hooks calls (which may have a different search_path).
+    local loaded_snapshot = {}
+    for k, v in pairs(package.loaded) do loaded_snapshot[k] = v end
     local ok, config = pcall(fennel.eval, src, {allowedGlobals = false})
+    package.loaded = loaded_snapshot
     fennel.path = orig_path
     fennel["macro-path"] = orig_macro_path
     if not ok then return end
