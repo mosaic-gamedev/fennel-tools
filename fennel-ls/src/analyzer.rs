@@ -1488,12 +1488,13 @@ fn tail_may_return_multiple(node: &AstNode) -> bool {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
-    analyze_with_hooks(ast, &HashMap::new())
+    analyze_with_hooks(ast, &HashMap::new(), &HashMap::new())
 }
 
 pub fn analyze_with_hooks(
     ast: &[AstNode],
     hook_results: &HashMap<u32, Vec<crate::hooks::Instruction>>,
+    global_macros: &HashMap<String, String>,
 ) -> AnalysisResult {
     let mut analyzer = Analyzer::new_with_hooks(hook_results.clone());
 
@@ -1508,6 +1509,18 @@ pub fn analyze_with_hooks(
         end: u32::MAX,
         ..global_span
     });
+
+    // Pre-define global macros in the root scope so they're visible in every
+    // file without an explicit (import-macros ...). Synthetic byte offsets
+    // (u32::MAX - i) place them outside any real source range.
+    for (i, (name, source_module)) in global_macros.iter().enumerate() {
+        let synthetic_byte = u32::MAX - i as u32;
+        let span = Span { start: synthetic_byte, end: synthetic_byte, line: 0, col: 0, end_line: 0, end_col: 0 };
+        let byte = analyzer.define(name, &span, DefKind::Macro, None, None);
+        if let Some(def) = analyzer.result.defs.get_mut(&byte) {
+            def.source_module = Some(source_module.clone());
+        }
+    }
 
     analyzer.analyze_forms(ast);
 
@@ -2615,7 +2628,7 @@ mod tests {
                 span: name_span,
             },
         ]);
-        let second_pass = analyze_with_hooks(&ast, &hook_results);
+        let second_pass = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
 
         // Should be a proper def now, not in_macro
         let def = second_pass.defs.values()
@@ -2648,7 +2661,7 @@ mod tests {
         let hook_results = make_hook_results(call_span, vec![
             crate::hooks::Instruction::AnalyzeFn { index: 3 },
         ]);
-        let second_pass = analyze_with_hooks(&ast, &hook_results);
+        let second_pass = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
 
         assert!(has_def(&second_pass, "greet"), "greet should be a def via AnalyzeFn");
         assert_eq!(def_kind(&second_pass, "greet"), Some(DefKind::Fn));
@@ -2673,7 +2686,7 @@ mod tests {
 
         // Hook provides no instructions (empty vec = hook present, skip all args)
         let hook_results = make_hook_results(call_span, vec![]);
-        let second_pass = analyze_with_hooks(&ast, &hook_results);
+        let second_pass = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
 
         // extends and Base should not appear in syms (not analyzed at all)
         let base_syms: Vec<_> = second_pass.syms.iter()

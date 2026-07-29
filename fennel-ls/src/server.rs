@@ -99,6 +99,14 @@ impl Backend {
             std::sync::atomic::Ordering::Relaxed,
         );
 
+        // Flatten global-macros: {module → [name, ...]} → {name → module}
+        let global_macros: std::collections::HashMap<String, String> = config.global_macros
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|(module, names)| names.into_iter().map(move |n| (n, module.clone())))
+            .collect();
+        self.workspace.configure_global_macros(global_macros);
+
         // Pass `.lsp.fnl` source to the hook runner so it can extract `:macro-hooks`.
         if let Ok(src) = std::fs::read_to_string(root.join(".lsp.fnl")) {
             let search_path = root.to_string_lossy().into_owned();

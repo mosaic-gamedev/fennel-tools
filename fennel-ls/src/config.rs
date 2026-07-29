@@ -29,6 +29,12 @@ pub struct Config {
     /// Default: false. Enable with `:warn-unhooked-macros true` in `.lsp.fnl`.
     #[serde(alias = "warn-unhooked-macros")]
     pub warn_unhooked_macros: Option<bool>,
+
+    /// Macros that are globally available in every file without import-macros.
+    /// Keys are module paths, values are lists of macro names from that module.
+    /// Example: `{:global-macros {"addons.fennel-gdextension.defnode" [:defnode]}}`
+    #[serde(alias = "global-macros")]
+    pub global_macros: Option<HashMap<String, Vec<String>>>,
 }
 
 impl Config {

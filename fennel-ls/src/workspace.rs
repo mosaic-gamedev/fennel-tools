@@ -1,7 +1,7 @@
 /// File state management. Each open file is parsed and analyzed on every change.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 
@@ -148,6 +148,9 @@ pub struct Workspace {
     /// Cache of analyzed module files (required but not open).
     /// Keyed by absolute filesystem path; bounded by number of unique source files.
     require_cache: Arc<DashMap<std::path::PathBuf, Arc<ModuleExports>>>,
+    /// Macros pre-defined in every file's root scope (macro_name → source_module).
+    /// Set from `.lsp.fnl`'s `:global-macros` table via `configure_global_macros`.
+    global_macros: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Default for Workspace {
@@ -156,6 +159,7 @@ impl Default for Workspace {
             files: Arc::default(),
             builtins: Arc::new(OnceLock::new()),
             require_cache: Arc::default(),
+            global_macros: Arc::default(),
         }
     }
 }
@@ -169,6 +173,12 @@ impl Workspace {
     /// any `builtins()` access; silently ignored if already initialised.
     pub fn configure_platform(&self, platform: Platform) {
         let _ = self.builtins.set(Arc::new(BuiltinSet::for_platform(platform)));
+    }
+
+    /// Set macros that are pre-defined in every file's root scope.
+    /// `macros` maps macro_name → source_module (the module path used to look up hooks).
+    pub fn configure_global_macros(&self, macros: HashMap<String, String>) {
+        *self.global_macros.write().unwrap() = macros;
     }
 
     /// Replace the builtin set (builder style, for tests or pre-open config).
@@ -210,7 +220,8 @@ impl Workspace {
         }
 
         let (ast, parse_errors) = crate::parser::Parser::parse(&text);
-        let analysis = crate::analyzer::analyze_with_hooks(&ast, hook_results);
+        let gm = self.global_macros.read().unwrap();
+        let analysis = crate::analyzer::analyze_with_hooks(&ast, hook_results, &gm);
 
         // Resolve require bindings → module exports
         let mut modules: HashMap<String, Arc<ModuleExports>> = HashMap::new();
