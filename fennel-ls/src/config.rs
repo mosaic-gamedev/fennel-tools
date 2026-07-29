@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use serde::Deserialize;
 use mlua::prelude::*;
+use mlua::serde::de::{Deserializer as LuaDeserializer, Options as LuaDeOptions};
 
 /// Documentation entry for a single global name, loaded from `.lsp.fnl`.
 #[derive(Debug, Default, Deserialize)]
@@ -88,9 +89,15 @@ fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config>
     })?;
 
     log::debug!("load_fnl: deserializing result");
-    lua.from_value(result).map_err(|e| {
+    // Use deny_unsupported_types=false so Lua functions (e.g. from :macro-hooks)
+    // are silently skipped rather than causing the entire deserialization to fail.
+    let de = LuaDeserializer::new_with_options(
+        result,
+        LuaDeOptions::new().deny_unsupported_types(false),
+    );
+    Config::deserialize(de).map_err(|e| {
         log::warn!("load_fnl: deserialization failed: {e}");
-        e
+        LuaError::external(e)
     })
 }
 
