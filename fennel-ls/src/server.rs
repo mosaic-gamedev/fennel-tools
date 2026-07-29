@@ -99,11 +99,11 @@ impl Backend {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // Flatten global-macros: {module → [name, ...]} → {name → module}
+        // Global macros have no module path — they're embedded in the compiler.
         let global_macros: std::collections::HashMap<String, String> = config.global_macros
             .unwrap_or_default()
             .into_iter()
-            .flat_map(|(module, names)| names.into_iter().map(move |n| (n, module.clone())))
+            .map(|name| (name, String::new()))
             .collect();
         self.workspace.configure_global_macros(global_macros);
 

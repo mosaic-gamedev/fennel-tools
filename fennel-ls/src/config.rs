@@ -3,6 +3,26 @@ use serde::Deserialize;
 use mlua::prelude::*;
 use mlua::serde::de::{Deserializer as LuaDeserializer, Options as LuaDeOptions};
 
+/// Extract globally available macro names from the `global-macros` table in a `.lsp.fnl` result.
+///
+/// Expected format: `{:macro-name hook-fn-or-true}` — keys are macro names, values are
+/// hook functions (or any truthy value if no hook is needed).
+fn extract_global_macro_names(val: &LuaValue) -> Vec<String> {
+    let table = match val { LuaValue::Table(t) => t, _ => return vec![] };
+    let gm: LuaValue = match table.get("global-macros") { Ok(v) => v, _ => return vec![] };
+    let gm_table = match gm { LuaValue::Table(t) => t, _ => return vec![] };
+    let mut names = Vec::new();
+    for pair in gm_table.pairs::<LuaValue, LuaValue>() {
+        let (key, _) = match pair { Ok(p) => p, Err(_) => continue };
+        if let LuaValue::String(s) = key {
+            if let Ok(name) = s.to_str() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 /// Documentation entry for a single global name, loaded from `.lsp.fnl`.
 #[derive(Debug, Default, Deserialize)]
 pub struct GlobalDoc {
@@ -30,11 +50,14 @@ pub struct Config {
     #[serde(alias = "warn-unhooked-macros")]
     pub warn_unhooked_macros: Option<bool>,
 
-    /// Macros that are globally available in every file without import-macros.
-    /// Keys are module paths, values are lists of macro names from that module.
-    /// Example: `{:global-macros {"addons.fennel-gdextension.defnode" [:defnode]}}`
-    #[serde(alias = "global-macros")]
-    pub global_macros: Option<HashMap<String, Vec<String>>>,
+    /// Macros globally available in every file without `import-macros`.
+    ///
+    /// Format in `.lsp.fnl`: macro name → hook function (or `true`/`nil` for no hook):
+    ///   `{:global-macros {:extend-node extend-node-hook}}`
+    ///
+    /// Hook functions are extracted by `hooks::register_hooks` and stored as flat hooks.
+    /// Populated manually from the raw Lua table in `load_fnl`; not deserialized by serde.
+    pub global_macros: Option<Vec<String>>,
 }
 
 impl Config {
@@ -95,16 +118,23 @@ fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config>
     })?;
 
     log::debug!("load_fnl: deserializing result");
+    // Extract global macro names before serde consumes result (functions can't be deserialized).
+    let global_macros = extract_global_macro_names(&result);
+
     // Use deny_unsupported_types=false so Lua functions (e.g. from :macro-hooks)
     // are silently skipped rather than causing the entire deserialization to fail.
     let de = LuaDeserializer::new_with_options(
         result,
         LuaDeOptions::new().deny_unsupported_types(false),
     );
-    Config::deserialize(de).map_err(|e| {
+    let mut config = Config::deserialize(de).map_err(|e| {
         log::warn!("load_fnl: deserialization failed: {e}");
         LuaError::external(e)
-    })
+    })?;
+    if !global_macros.is_empty() {
+        config.global_macros = Some(global_macros);
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -168,6 +198,18 @@ mod tests {
         write_lsp_fnl(dir.path(), "this is not valid fennel {{{{");
         let config = Config::load(dir.path());
         assert!(config.platform.is_none());
+    }
+
+    #[test]
+    fn global_macros_with_hook_fn_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lsp_fnl(dir.path(), r#"
+{:global-macros {:extend-node (fn [call] []) :other-macro true}}
+"#);
+        let config = Config::load(dir.path());
+        let names = config.global_macros.unwrap();
+        assert!(names.contains(&"extend-node".to_string()));
+        assert!(names.contains(&"other-macro".to_string()));
     }
 
     #[test]

@@ -247,20 +247,32 @@ function register_hooks(src, search_path)
     fennel["macro-path"] = orig_macro_path
     if not ok then return end
     if type(config) ~= "table" then return end
-    local macro_hooks = config["macro-hooks"]
-    if type(macro_hooks) ~= "table" then return end
     _hooks = {}
-    for key, val in pairs(macro_hooks) do
-        if type(val) == "function" then
-            -- Flat syntax: {:macro-name fn}  →  matches any module
-            if not _hooks[""] then _hooks[""] = {} end
-            _hooks[""][key] = val
-        elseif type(val) == "table" then
-            -- Nested syntax: {"module.path" {:macro-name fn}}
-            _hooks[key] = {}
-            for name, fn_val in pairs(val) do
-                if type(fn_val) == "function" then
-                    _hooks[key][name] = fn_val
+    -- global-macros: {:macro-name hook-fn} — hook functions registered as flat hooks
+    local global_macros = config["global-macros"]
+    if type(global_macros) == "table" then
+        for name, val in pairs(global_macros) do
+            if type(val) == "function" then
+                if not _hooks[""] then _hooks[""] = {} end
+                _hooks[""][name] = val
+            end
+        end
+    end
+    -- macro-hooks: flat {:macro-name fn} or nested {"module.path" {:macro-name fn}}
+    local macro_hooks = config["macro-hooks"]
+    if type(macro_hooks) == "table" then
+        for key, val in pairs(macro_hooks) do
+            if type(val) == "function" then
+                -- Flat syntax: {:macro-name fn}  →  matches any module
+                if not _hooks[""] then _hooks[""] = {} end
+                _hooks[""][key] = val
+            elseif type(val) == "table" then
+                -- Nested syntax: {"module.path" {:macro-name fn}}
+                _hooks[key] = {}
+                for name, fn_val in pairs(val) do
+                    if type(fn_val) == "function" then
+                        _hooks[key][name] = fn_val
+                    end
                 end
             end
         end
